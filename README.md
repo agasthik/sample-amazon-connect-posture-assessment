@@ -4,62 +4,150 @@
 [![License](https://img.shields.io/badge/license-MIT--0-green.svg)](LICENSE)
 [![Well-Architected](https://img.shields.io/badge/AWS-Well--Architected-orange.svg)](https://aws.amazon.com/architecture/well-architected/)
 
+A read-only command-line tool that assesses an Amazon Connect Customer
+deployment against AWS Well-Architected Framework best practices and produces a
+shareable report in minutes. Point it at an AWS account and region, and it
+inventories the instance, parses your contact flows, maps what callers actually
+experience, and returns prioritized findings with remediation guidance.
 
-Evaluates Amazon Connect Customer deployments against AWS Well-Architected
-Framework best practices across five pillars: **Resilience**, **Security**,
-**Cost Optimization**, **Operational Excellence**, and **Performance
-Efficiency**.
-
-- **59 assessment checks** across the five Well-Architected pillars.
-- **Caller Journey Mapping** — resolves inbound phone numbers to contact flows,
-  renders an interactive caller-focused map, and separately scores caller paths
-  for authentication, self-service, and dead-end outcomes.
-- **Four report formats** — HTML, JSON, CSV, and ASFF (AWS Security Finding
-  Format) for ingestion into Security Hub.
-- **Read-only by default** — never mutates the resources it inspects; the only
-  write is the opt-in `--s3-output`, which publishes the report to its own
-  hardened S3 bucket.
-- **Runs anywhere** — a single CLI using your existing AWS credentials, no
-  agents or infrastructure to deploy.
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-  - [Requirements](#requirements)
-  - [Install](#install)
-  - [Run](#run)
-- [Sample Report](#sample-report)
-- [What It Checks](#what-it-checks)
-- [Deployment Architecture](#deployment-architecture)
-- [Documentation](#documentation)
-- [Security Model](#security-model)
-
-## Quick Start
-
-### Requirements
-
-- Python 3.12 or higher
-- AWS credentials with read access to the AWS account hosting the target Amazon Connect Customer instance
-- Internet access to AWS API endpoints
-
-### Install
-
-For repeated workstation use:
+No agents, no infrastructure to deploy, and nothing is modified in the account
+you assess.
 
 ```bash
+pipx install git+https://github.com/aws-samples/sample-connect-posture-assessment
+amazon-connect-assessment --region us-east-1 --output-dir ./reports
+```
+
+---
+
+## Contents
+
+- [What you get](#what-you-get)
+- [Sample report](#sample-report)
+- [Quick start](#quick-start)
+  - [1. Check prerequisites](#1-check-prerequisites)
+  - [2. Install](#2-install)
+  - [3. Grant read permissions](#3-grant-read-permissions)
+  - [4. Run the assessment](#4-run-the-assessment)
+  - [5. Open the report](#5-open-the-report)
+- [Common tasks](#common-tasks)
+- [What it assesses](#what-it-assesses)
+- [Caller Journey Map](#caller-journey-map)
+- [Report formats](#report-formats)
+- [Architecture](#architecture)
+- [Security and privacy](#security-and-privacy)
+- [Documentation](#documentation)
+- [Contributing and support](#contributing-and-support)
+- [License](#license)
+
+---
+
+## What you get
+
+| | |
+|---|---|
+| **59 assessment checks** | Across all five Well-Architected pillars — Security, Resilience, Cost Optimization, Operational Excellence, and Performance Efficiency. Each finding carries a severity, the evidence behind it, and concrete remediation steps. |
+| **Contact flow analysis** | Parses published flow content to find dead-end error paths, unreachable blocks, infinite loops, toll-fraud exposure, prompt-injection risk, and unvalidated Lambda and Lex outputs — issues that are invisible from the console. |
+| **Caller Journey Map** | Resolves each inbound phone number to the flow it is actually associated with, enumerates the paths a caller can take, and renders an interactive map you can zoom, inspect, and export. |
+| **Generative AI coverage** | Checks Amazon Q in Connect assistants and knowledge bases for guardrails, customer-managed KMS encryption, ingestion health, Bedrock invocation logging, and model cost posture. |
+| **Four output formats** | HTML, JSON, CSV, and ASFF for direct ingestion into AWS Security Hub. |
+| **Run-over-run comparison** | `--diff` against a previous JSON report shows what was resolved and what is new, so you can track remediation progress. |
+| **Safe by default** | Every API call is a read or describe. The single optional write, `--s3-output`, publishes the finished report to its own hardened bucket. |
+
+---
+
+## Sample report
+
+Checkout the sample [`html report`](https://aws-samples.github.io/sample-connect-posture-assessment/examples/sample_assessment_report.html)
+
+![Sample Amazon Connect Customer assessment report](docs/images/sample-assessment-report.png)
+
+
+
+---
+
+## Quick start
+
+### 1. Check prerequisites
+
+- **Python 3.12 or later** — `python3 --version`
+- **AWS credentials** for the account hosting the Amazon Connect Customer instance
+- **Network access** to AWS API endpoints
+
+### 2. Install
+
+The recommended install uses [pipx](https://pipx.pypa.io/), which keeps the tool
+in its own isolated environment and puts the command on your `PATH`:
+
+```bash
+# Install pipx once
 brew install pipx                       # macOS
 python3 -m pip install --user pipx      # Linux / Windows
 python3 -m pipx ensurepath
 
+# Install the assessment tool
+pipx install git+https://github.com/aws-samples/sample-connect-posture-assessment
+```
+
+<details>
+<summary>Alternative: clone and install from source</summary>
+
+```bash
 git clone https://github.com/aws-samples/sample-connect-posture-assessment
 cd sample-connect-posture-assessment
 pipx install .
 ```
 
-For contributor setup, testing, AWS access, CloudShell, and other installation
-paths, see the [User Guide](docs/user-guide.md).
+</details>
 
-### Run
+<details>
+<summary>Alternative: AWS CloudShell or a virtual environment</summary>
+
+CloudShell already has credentials and Python available, which makes it the
+fastest way to run a one-off assessment. See
+[Installation](docs/user-guide.md#installation) in the User Guide for CloudShell
+and contributor virtual-environment setup.
+
+</details>
+
+Confirm the install:
+
+```bash
+amazon-connect-assessment --version
+```
+
+### 3. Grant read permissions
+
+The tool needs read access to Amazon Connect Customer and a handful of
+supporting AWS services. Check whether your current identity already has it:
+
+```bash
+amazon-connect-assessment --check-permissions --region us-east-1
+```
+
+If permissions are missing, deploy the bundled least-privilege policy and attach
+it to your IAM user or role:
+
+```bash
+aws cloudformation deploy \
+  --stack-name amazon-connect-assessment-permissions \
+  --template-file cloudformation/AmazonConnectSelfAssessmentPolicy.yaml \
+  --parameter-overrides AttachToRoleName=YOUR_ROLE_NAME \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+```
+
+Use `AttachToUserName=YOUR_USERNAME` to attach to an IAM user instead, or omit
+both parameters to create the policy without attaching it. The exact action list
+is published at
+[`docs/iam-policy-template.json`](docs/iam-policy-template.json) if you prefer to
+fold it into an existing role or permission set.
+
+> **Note:** The CloudFormation template intentionally grants read permissions
+> only. It does not include the S3 write permissions required by the optional
+> `--s3-output` flag.
+
+### 4. Run the assessment
 
 ```bash
 amazon-connect-assessment \
@@ -67,90 +155,174 @@ amazon-connect-assessment \
   --output-dir ./reports
 ```
 
-Open the generated HTML report:
+The tool discovers every Amazon Connect Customer instance in the region. To
+scope the run to one instance, add `--instance-id <instance-id>`.
+
+### 5. Open the report
 
 ```bash
 open reports/connect_assessment_*.html        # macOS
 xdg-open reports/connect_assessment_*.html    # Linux
+start reports\connect_assessment_*.html       # Windows
 ```
 
-## Sample Report
+The HTML report is a single self-contained file with no external dependencies —
+safe to email or attach to a ticket.
 
-The repository includes a representative HTML report:
+---
 
-![Sample Amazon Connect assessment report](docs/images/sample-assessment-report.png)
+## Common tasks
 
-Regenerate the screenshot after changing the sample report:
+| Goal | Command |
+|---|---|
+| Validate access before a long run | `amazon-connect-assessment --check-permissions --region us-east-1` |
+| See exactly what would run, without calling AWS | `amazon-connect-assessment --dry-run --region us-east-1` |
+| List every check and its severity | `amazon-connect-assessment --list-checks` |
+| Assess a single instance | `amazon-connect-assessment --region us-east-1 --instance-id <id>` |
+| Focus on one or more pillars | `amazon-connect-assessment --region us-east-1 --pillars security resilience` |
+| Report only high-impact findings | `amazon-connect-assessment --region us-east-1 --severity critical high` |
+| Run a specific check | `amazon-connect-assessment --region us-east-1 --checks sec-toll-fraud-001` |
+| Produce every output format | `amazon-connect-assessment --region us-east-1 --output-format html json csv asff` |
+| Compare against a previous run | `amazon-connect-assessment --region us-east-1 --diff ./reports/baseline.json` |
+| Publish the report to S3 | `amazon-connect-assessment --region us-east-1 --s3-output` |
+| Use a named or SSO profile | `amazon-connect-assessment --profile my-profile --region us-east-1` |
+| Speed up a large instance | `amazon-connect-assessment --region us-east-1 --skip-flow-analysis` |
+| Troubleshoot with full logging | `amazon-connect-assessment --region us-east-1 -vv --log-file run.log` |
 
-```bash
-pip install -e ".[screenshots]"
-playwright install chromium
-python scripts/capture_screenshots.py
-```
+Checks run in parallel by default. Use `--sequential`, `--max-workers`, and
+`--batch-size` to tune throughput, and `--resume-assessment` to continue an
+interrupted run. See the [User Guide](docs/user-guide.md) and
+[Performance Guide](docs/performance-optimization.md) for the full flag
+reference, and the [Configuration Guide](docs/configuration.md) to persist your
+options in a YAML or JSON config file.
 
-Validate credentials and permissions before a full run:
+---
 
-```bash
-amazon-connect-assessment --check-permissions --region us-east-1
-```
+## What it assesses
 
-For least-privilege permissions, review the generated canonical policy at
-[`docs/iam-policy-template.json`](docs/iam-policy-template.json). Deploy the
-same permission set with
-[`cloudformation/AmazonConnectSelfAssessmentPolicy.yaml`](cloudformation/AmazonConnectSelfAssessmentPolicy.yaml),
-or integrate the JSON actions into your existing role or permission set.
+59 checks across the five Well-Architected pillars, plus 4 separately scored
+caller journey findings.
 
-## What It Checks
-
-| Area | Registered checks | Checks or findings |
+| Pillar | Checks | Representative coverage |
 |---|---:|---|
-| Security | 22 | Encryption, CloudTrail, IAM, contact-flow authentication, approved origins, toll fraud, AI-agent security, Q assistant guardrail availability, and Q resource encryption |
-| Resilience | 13 | Global Resiliency, CloudWatch alarms, flow error handling, loop detection, routing, carrier diversity, per-call-site Lambda dependency risk, and Q-scoped Bedrock cross-region availability |
-| Cost Optimization | 15 | Unused numbers, containment, idle resources, callback opportunities, IVR data continuity, route-aware DTMF-only self-service, and Q prompt model cost review |
-| Operational Excellence | 6 | Contact-flow logging, early media, SSML voice fallback, unreachable action analysis, Q knowledge-base lifecycle/ingestion health, and Q-scoped Bedrock logging |
-| Performance Efficiency | 3 | Route-aware Lambda usage, descriptive flow structure metrics, and sequential Lambda routes |
-| Caller Journey Mapping | Separate 4 findings | Phone-number topology, caller paths, authentication, self-service, and dead-end journeys |
+| Security | 22 | Storage and KMS encryption, CloudTrail audit coverage, IAM service-role least privilege, security-profile audit, CCP approved origins, toll fraud, prompt injection, sensitive data in contact attributes, unvalidated Lambda and Lex outputs, AI cascade risk, Amazon Q guardrails and encryption |
+| Resilience | 13 | Amazon Connect Global Resiliency posture (identity type, traffic distribution group status and split, failover testing, phone-number binding), CloudWatch alarms, flow error handling, loop detection, carrier diversity, per-call-site Lambda dependency risk, Bedrock cross-region inventory |
+| Cost Optimization | 15 | Unused claimed numbers, self-service containment, callback opportunities, IVR data continuity into the agent screen pop, DTMF-only self-service tiers, idle configuration, hours-of-operation mismatch, premium-feature enablement, Amazon Q model cost review |
+| Operational Excellence | 6 | Contact flow logging, early media, SSML voice fallback, unreachable-block analysis, Amazon Q knowledge-base lifecycle and ingestion health, Bedrock invocation logging |
+| Performance Efficiency | 3 | Route-aware Lambda usage, sequential Lambda invocations, descriptive flow-complexity metrics |
+| Caller Journey | 4 findings | Phone-number and flow topology scope, caller-path authentication, self-service coverage, dead-end journeys |
 
-The **Caller Journey Map** is phone-number-first. It uses
-`connect:ListFlowAssociations` to match each `PhoneNumberArn` to its assigned
-flow rather than treating `ListPhoneNumbersV2.TargetArn` as a flow ARN. The CLI
-server-renders a deterministic caller-focused projection into the self-contained
-HTML report; browser code switches phone-number views, applies zoom and fit
-controls without squishing the native layout, opens the node/connector
-inspector, and downloads SVG, PNG, or editable draw.io artifacts. There is no
-separate web-service launcher required for this report flow.
+Run `amazon-connect-assessment --list-checks` for the live registry, or see the
+[Check Catalog](docs/check-catalog.md) for every check ID, its severity, the
+permissions it requires, and what it does and does not prove.
 
-Run `amazon-connect-assessment --list-checks` for the live check registry.
-See the [Check Catalog](docs/check-catalog.md) for implemented checks and
-journey findings.
+Findings are deliberately honest about certainty. Checks that report context
+rather than defects — configuration inventory, optional-capability status,
+observations that depend on your business requirements — say so in their
+description instead of being presented as problems to fix.
 
-## Deployment Architecture
+---
+
+## Caller Journey Map
+
+Most assessment tooling inspects resources. The Caller Journey Map inspects the
+**experience**, starting from the phone number a customer actually dials.
+
+- **Accurate flow resolution.** Each inbound number is matched to its flow using
+  `connect:ListFlowAssociations`, rather than assuming
+  `ListPhoneNumbersV2.TargetArn` points at a flow.
+- **Path enumeration.** Every default, conditional, and error transition is
+  walked from each entry point to build the set of paths a caller can take.
+- **Scored outcomes.** Paths are scored for authentication, self-service
+  coverage, and dead-end outcomes, and surfaced as the four `journey-*` findings.
+- **Interactive, offline map.** The CLI server-renders a deterministic
+  caller-focused projection into the HTML report. In the browser you can switch
+  between phone numbers, zoom and fit without distorting the layout, open a
+  node and connector inspector, and export SVG, PNG, or an editable draw.io
+  diagram.
+
+No separate web service or launcher is required — it is part of the standard
+HTML report.
+
+Phone numbers are masked in report evidence, preserving only the last four
+digits.
+
+---
+
+## Report formats
+
+| Format | Flag value | Use it for |
+|---|---|---|
+| **HTML** | `html` (default) | Review and hand-off. Single self-contained file including the journey map. |
+| **JSON** | `json` | Automation, custom dashboards, and as the baseline for `--diff`. |
+| **CSV** | `csv` | Spreadsheet triage and remediation tracking. |
+| **ASFF** | `asff` | Direct ingestion into AWS Security Hub. |
+
+Combine formats in one run and control naming with `--output-filename`, which
+supports the `{timestamp}`, `{account_id}`, and `{region}` placeholders. See
+[Report Formats](docs/report-formats.md) for each output contract.
+
+---
+
+## Architecture
 
 ![Amazon Connect Customer Assessment Tool deployment architecture](docs/architecture.svg)
 
+The [editable Draw.io source](docs/architecture.drawio) is included.
+
+---
+
+## Security and privacy
+
+- **Read-only against assessed resources.** The tool never mutates the Amazon
+  Connect Customer instance, flows, or supporting resources it inspects.
+- **Standard credential resolution.** Credentials are resolved through the
+  normal boto3 chain and are never written to reports, logs, or checkpoints.
+- **Opt-in S3 publishing only.** `--s3-output` is the only write path. If the
+  target bucket does not exist it is created with Block Public Access, SSE-S3
+  encryption, and versioning enabled.
+- **Reports contain configuration detail.** Findings include flow names, queue
+  and routing configuration, and masked phone numbers. Treat generated reports
+  as sensitive and store them accordingly.
+
+See the [Threat Model](docs/threat-model.md) for trust boundaries, residual
+risks, and hardening recommendations.
+
+---
+
 ## Documentation
 
-The [Documentation](docs/README.md) is organized into the following detailed guides:
+| Guide | Covers |
+|---|---|
+| [User Guide](docs/user-guide.md) | Installation paths, AWS access, CLI usage, S3 publishing, run comparison, CI/CD |
+| [Configuration](docs/configuration.md) | YAML and JSON settings, precedence, output naming, execution tuning |
+| [Check Catalog](docs/check-catalog.md) | Every check and journey finding, required permissions, subset selection |
+| [Report Formats](docs/report-formats.md) | HTML, JSON, CSV, and ASFF output contracts |
+| [Performance Guide](docs/performance-optimization.md) | Parallel execution, retry tuning, journey-scoring bounds |
+| [Troubleshooting](docs/troubleshooting.md) | Installation, credentials, permissions, runtime, and report issues |
+| [Threat Model](docs/threat-model.md) | Trust boundaries, attack surfaces, mitigations |
+| [Development Guide](docs/development-guide.md) | Architecture, testing, code quality, adding a check |
+| [Documentation Index](docs/README.md) | Full documentation map and source-of-truth rules |
 
-- [Deployment Architecture](#deployment-architecture) — rendered SVG
-- [User Guide](docs/user-guide.md) — installation, AWS access, CLI usage, S3,
-  run comparisons, and CI/CD
-- [Configuration](docs/configuration.md) — YAML/JSON settings, precedence,
-  output naming, and execution tuning
-- [Report Formats](docs/report-formats.md) — HTML, JSON, CSV, and ASFF output
-- [Check Catalog](docs/check-catalog.md) — checks, findings, permissions, and
-  subset selection
-- [Performance Guide](docs/performance-optimization.md) — parallel execution,
-  retries, and journey-scoring bounds
-- [Troubleshooting](docs/troubleshooting.md) — installation, credentials,
-  permissions, runtime, and report issues
-- [Development Guide](docs/development-guide.md) — architecture, testing, and
-  adding checks
-- [Threat Model](docs/threat-model.md) — trust boundaries and mitigations
+---
 
-## Security Model
+## Contributing and support
 
-The tool does not modify the Amazon Connect Customer resources it inspects. AWS credentials are resolved through the standard boto3 credential chain and are not written to reports. The optional S3 report bucket is hardened with Block Public Access, SSE-S3 encryption, and versioning.
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Development Guide](docs/development-guide.md) for project setup, test
+execution, and the conventions for adding a check.
 
-See the [Threat Model](docs/threat-model.md) for security assumptions,
-residual risks, and hardening recommendations.
+- **Something not working?** Check [Troubleshooting](docs/troubleshooting.md)
+  first, then open a GitHub issue with the output of
+  `amazon-connect-assessment --version` and a `-vv` log.
+- **Security issue?** Do not open a public issue. Follow the
+  [AWS vulnerability reporting process](https://aws.amazon.com/security/vulnerability-reporting/).
+
+This is sample code published for demonstration and evaluation purposes. It is
+not an AWS service and is not covered by AWS Support.
+
+---
+
+## License
+
+Licensed under the MIT-0 License. See [LICENSE](LICENSE).

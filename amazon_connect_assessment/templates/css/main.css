@@ -7,9 +7,18 @@
 
 :root {
     /* Cloudscape Design System Color Palette */
+    /* Three-step neutral ramp so the hierarchy is legible: a deeper page
+       background lets white section containers lift off it, and a distinctly
+       tinted widget/header shade reads as an inset element on those white
+       sections. Previously all three were near-white (#f9f9f9/#ffffff/#fafafa)
+       and separated only by hairline borders. */
     --awsui-color-background-container-content: #ffffff;
-    --awsui-color-background-container-header: #fafafa;
-    --awsui-color-background-layout-main: #f9f9f9;
+    /* Cool, faintly blue-tinted off-white for secondary surfaces (widget
+       tiles, metadata/evidence panels, container headers) — lighter and less
+       grey-heavy than a flat neutral, with a subtle tie to the AWS blue
+       accent. Panel edges are carried by the firmer border token. */
+    --awsui-color-background-container-header: #eff3f9;
+    --awsui-color-background-layout-main: #e6e9ed;
     --awsui-color-background-home-header: #232f3e;
 
     --awsui-color-text-body-default: #16191f;
@@ -21,8 +30,8 @@
     --awsui-color-text-status-info: #0972d3;
     --awsui-color-text-status-warning: #8d6605;
 
-    --awsui-color-border-container-top: #e9ebed;
-    --awsui-color-border-divider-default: #e9ebed;
+    --awsui-color-border-container-top: #c3c8d0;
+    --awsui-color-border-divider-default: #d3d7dd;
     --awsui-color-border-item-focused: #0972d3;
 
     /* Primary Colors */

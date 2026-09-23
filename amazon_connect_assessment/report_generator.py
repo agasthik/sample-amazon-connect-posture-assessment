@@ -527,6 +527,10 @@ class ReportGenerator:
             # Styling and assets
             "embedded_css": self._load_external_css(),
             "embedded_js": self._load_external_js(),
+            # Inlined so the report stays a single self-contained file. Empty
+            # string when the asset is missing; the header falls back to the
+            # Font Awesome headset glyph.
+            "service_icon_svg": self._load_service_icon(),
         }
 
         return context
@@ -1296,6 +1300,23 @@ class ReportGenerator:
         except Exception as e:
             self.logger.error(f"Failed to load external CSS: {e}")
             return ""
+
+    def _load_service_icon(self) -> str:
+        """Return the inline SVG for the header service icon.
+
+        Reads the bundled asset so it can be embedded directly in the report
+        (keeping the output a single self-contained file). Returns an empty
+        string if the asset is missing, letting the header template fall back
+        to the Font Awesome glyph.
+        """
+        try:
+            icon_path = Path(__file__).parent / "templates" / "assets" / "amazon-connect.svg"
+            if icon_path.exists():
+                return icon_path.read_text(encoding="utf-8")
+            self.logger.warning(f"Service icon not found: {icon_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to load service icon: {e}")
+        return ""
 
     def _load_external_js(self) -> str:
         """Load JavaScript from external template files."""

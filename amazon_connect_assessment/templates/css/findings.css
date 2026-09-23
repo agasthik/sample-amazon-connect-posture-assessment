@@ -220,6 +220,13 @@ body.dark-mode .btn-secondary:hover {
     gap: var(--space-xs);
     white-space: nowrap;
     border-bottom: 3px solid transparent;
+    /* Vertical separator so each inactive tab reads as a distinct segment
+       rather than merging into one bar. Removed on the last tab below. */
+    border-right: 1px solid var(--awsui-color-border-divider-default);
+}
+
+.pillar-tab:last-child {
+    border-right: none;
 }
 
 .pillar-tab:hover {
@@ -653,7 +660,11 @@ body.dark-mode .finding-card[data-status="not_applicable"] {
 }
 
 .meta-item {
-    color: var(--awsui-color-text-body-secondary);
+    /* Values (check ID, resource ID, timestamp) are the data readers scan
+       for, so they use the default body color for strong contrast on the
+       grey meta panel; the bold labels below keep the label/value hierarchy.
+       Previously the secondary grey (#5f6b7a) washed out on the panel. */
+    color: var(--awsui-color-text-body-default);
     text-shadow: none;
     font-weight: var(--font-weight-normal);
     line-height: var(--line-height-body-s);

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amazon-connect-assessment"
-version = "0.1.0"
+version = "1.0.0"
 description = "Assess Amazon Connect deployments against AWS Well-Architected Framework best practices"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -56,7 +56,10 @@ test = [
 ]
 screenshots = [
     "playwright==1.55.0",
-    "pillow==11.3.0",
+    # >=12.3.0 clears the Pillow CVE-2026-* advisories (OOB writes,
+    # decompression bombs, command injection). Dev-only extra used by
+    # scripts/capture_screenshots.py; not a runtime dependency.
+    "pillow>=12.3.0",
 ]
 
 [project.scripts]
@@ -71,6 +74,7 @@ amazon_connect_assessment = [
     "templates/html/partials/*.html",
     "templates/css/*.css",
     "templates/js/*.js",
+    "templates/assets/*.svg",
 ]
 
 [tool.pytest.ini_options]

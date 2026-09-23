@@ -1392,7 +1392,7 @@ class AssessmentEngine:
 
             return version("amazon-connect-assessment")
         except Exception:
-            return "0.1.0"
+            return "1.0.0"
 
     def _get_execution_environment(self) -> str:
         """Determine the execution environment with enhanced detection."""

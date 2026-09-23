@@ -55,6 +55,15 @@ _QUOTA_PAGE_LIMIT = 20
 _QUOTA_PAGE_SIZE = 100
 _PHONE_NUMBER_PAGE_LIMIT = 20
 _PHONE_NUMBER_PAGE_SIZE = 100
+_USER_PAGE_LIMIT = 20
+_USER_PAGE_SIZE = 100
+
+# Amazon Connect publishes ConcurrentCalls under *both* of these dimensions, and
+# CloudWatch keys every metric on its complete dimension set. A query naming
+# InstanceId alone therefore matches no metric and returns an empty datapoint
+# list — which these checks would read as "this instance carried no call
+# traffic" on an instance that is in fact busy.
+_CONCURRENT_CALLS_METRIC_GROUP = "VoiceCalls"
 
 # Metric window for the headroom check.
 _HEADROOM_LOOKBACK_DAYS = 30
@@ -257,7 +266,10 @@ def _daily_peaks(
         "cloudwatch",
         Namespace="AWS/Connect",
         MetricName="ConcurrentCalls",
-        Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+        Dimensions=[
+            {"Name": "InstanceId", "Value": instance_id},
+            {"Name": "MetricGroup", "Value": _CONCURRENT_CALLS_METRIC_GROUP},
+        ],
         StartTime=start,
         EndTime=end,
         Period=86400,
@@ -273,8 +285,16 @@ def _daily_peaks(
     return points
 
 
-def _weekly_peaks(points: List[Tuple[datetime, float]]) -> List[float]:
-    """Collapse daily peaks into consecutive 7-day peaks, oldest first."""
+def _weekly_peaks(points: List[Tuple[datetime, float]]) -> List[Tuple[int, float]]:
+    """
+    Collapse daily peaks into ``(week index, peak)`` pairs, oldest first.
+
+    The week index is carried rather than discarded because the buckets are not
+    necessarily consecutive — CloudWatch returns no datapoint for a week the
+    instance took no calls, so a 90-day window can contain gaps. Regressing
+    against list position instead of elapsed weeks would compress each gap into
+    a single step and overstate the growth rate by the size of the gap.
+    """
     if not points:
         return []
     origin = points[0][0]
@@ -282,22 +302,27 @@ def _weekly_peaks(points: List[Tuple[datetime, float]]) -> List[float]:
     for timestamp, value in points:
         week = (timestamp - origin).days // 7
         buckets[week] = max(buckets.get(week, value), value)
-    return [buckets[week] for week in sorted(buckets)]
+    return [(week, buckets[week]) for week in sorted(buckets)]
 
 
-def _linear_slope(values: List[float]) -> float:
+def _linear_slope(points: List[Tuple[int, float]]) -> float:
     """
-    Least-squares slope of ``values`` against their index.
+    Least-squares slope of weekly peak against elapsed week index.
 
     Used instead of comparing first and last points so a single anomalous week
     (an outage, a marketing spike) cannot by itself manufacture or erase a
-    trend.
+    trend. Weeks with no datapoint are absent from ``points`` rather than
+    present as zero: CloudWatch reporting nothing is not the same claim as the
+    instance having taken no calls, and zero-filling would drag the fitted slope
+    toward whichever side of the window the gap falls on.
     """
-    n = len(values)
-    mean_x = (n - 1) / 2
-    mean_y = sum(values) / n
-    numerator = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(values))
-    denominator = sum((i - mean_x) ** 2 for i in range(n))
+    n = len(points)
+    if n == 0:
+        return 0.0
+    mean_x = sum(week for week, _ in points) / n
+    mean_y = sum(value for _, value in points) / n
+    numerator = sum((week - mean_x) * (value - mean_y) for week, value in points)
+    denominator = sum((week - mean_x) ** 2 for week, _ in points)
     if denominator == 0:
         return 0.0
     return numerator / denominator
@@ -333,6 +358,38 @@ def _list_phone_number_count(factory: Any, target_arn: str) -> int:
     return total
 
 
+def _list_user_count(factory: Any, instance_id: str) -> int:
+    """
+    Count every user configured on an instance.
+
+    Counted from the API here rather than read off ``ConnectInstance.users``
+    because no analyzer in the assessment pipeline calls ListUsers — that
+    collection is empty on every ordinary run, so deriving the count from it
+    reported the users quota as unmeasured for every customer. ``connect:
+    ListUsers`` is already part of the granted read set.
+    """
+    total = 0
+    next_token: Optional[str] = None
+    for _ in range(_USER_PAGE_LIMIT):
+        kwargs: Dict[str, Any] = {
+            "InstanceId": instance_id,
+            "MaxResults": _USER_PAGE_SIZE,
+        }
+        if next_token:
+            kwargs["NextToken"] = next_token
+        response = factory.call_api_with_resilience(
+            factory.get_connect_client(),
+            "list_users",
+            "connect",
+            **kwargs,
+        )
+        total += len(response.get("UserSummaryList") or [])
+        next_token = response.get("NextToken")
+        if not next_token:
+            break
+    return total
+
+
 class ConfigurationQuotaUtilizationCheck(BaseCheck):
     """Compare configuration-object counts against their per-instance quotas."""
 
@@ -359,10 +416,13 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
         profile, and security profile, so an empty list means discovery was
         denied or skipped — and reporting 0% utilization in that case would be a
         false PASS on precisely the instance whose data is missing.
+
+        Users and phone numbers are counted directly from their list APIs, both
+        of which this check owns because no analyzer collects them.
         """
         instance = context.instance
+        factory = context.aws_client_factory
         candidates = {
-            "users": len(instance.users),
             "queues": len(instance.queues),
             "routing_profiles": len(instance.routing_profiles),
             "security_profiles": len(instance.security_profiles),
@@ -371,16 +431,21 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
         counts = {key: value for key, value in candidates.items() if value > 0}
         unmeasured = [key for key, value in candidates.items() if value == 0]
 
-        try:
-            counts["phone_numbers"] = _list_phone_number_count(
-                context.aws_client_factory, instance.instance_arn
-            )
-        except Exception as exc:
-            if not context.aws_client_factory.is_access_denied(exc):
-                raise
-            # A denied phone-number read shouldn't discard the five subjects we
-            # can still measure from data already collected.
-            unmeasured.append("phone_numbers")
+        # Each API-backed subject is counted in its own try block so a denial on
+        # one does not discard the other, or the four subjects already measured
+        # from collected data. Unlike an empty collection, a count of zero from a
+        # call that succeeded is a real measurement: a new instance can legitimately
+        # hold no claimed numbers.
+        for key, counter in (
+            ("users", lambda: _list_user_count(factory, instance.instance_id)),
+            ("phone_numbers", lambda: _list_phone_number_count(factory, instance.instance_arn)),
+        ):
+            try:
+                counts[key] = counter()
+            except Exception as exc:
+                if not factory.is_access_denied(exc):
+                    raise
+                unmeasured.append(key)
 
         return counts, unmeasured
 
@@ -715,6 +780,7 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
             raise
 
         weekly = _weekly_peaks(points)
+        weekly_evidence = [{"week_index": week, "peak": peak} for week, peak in weekly]
         if len(weekly) < _MIN_GROWTH_DATA_POINTS:
             return self.not_applicable(
                 context,
@@ -723,17 +789,21 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
                     f"at least {_MIN_GROWTH_DATA_POINTS} are needed before a trend is "
                     "meaningful"
                 ),
-                evidence={"weekly_peaks": weekly},
+                evidence={"weekly_peaks": weekly_evidence},
             )
 
         slope = round(_linear_slope(weekly), 2)
-        latest = weekly[-1]
+        latest = weekly[-1][1]
+        # Reported alongside the observed count so a reader can see that a trend
+        # fitted over four datapoints may span considerably more than four weeks.
+        weeks_spanned = weekly[-1][0] - weekly[0][0] + 1
         evidence: Dict[str, Any] = {
             "instance_alias": instance.instance_alias,
             "quota_name": quota_name,
             "quota_value": quota_value,
-            "weekly_peaks": weekly,
+            "weekly_peaks": weekly_evidence,
             "weeks_observed": len(weekly),
+            "weeks_spanned": weeks_spanned,
             "growth_calls_per_week": slope,
             "latest_weekly_peak": latest,
             "horizon_weeks": _GROWTH_HORIZON_WEEKS,
@@ -746,8 +816,8 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
                 resource_type="ConnectInstance",
                 description=(
                     f"Peak concurrent calls on instance {instance.display_name} are flat "
-                    f"or declining across the last {len(weekly)} weeks "
-                    f"({slope:+.2f} calls per week), so the "
+                    f"or declining across the last {weeks_spanned} weeks "
+                    f"({len(weekly)} with data, {slope:+.2f} calls per week), so the "
                     f"{int(quota_value)}-call quota is not being approached."
                 ),
                 evidence=evidence,

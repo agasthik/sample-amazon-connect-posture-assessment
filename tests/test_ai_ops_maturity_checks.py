@@ -23,6 +23,10 @@ def _wire_access_denied(factory):
     # empty unless a test deliberately supplies it.
     factory.get_qconnect_assistant_resilient.return_value = {"assistant": {}}
     factory.list_ai_agents_resilient.return_value = {"aiAgentSummaries": []}
+    # Default the individual agent read to "nothing returned", so a test that
+    # binds an agent without wiring GetAIAgent lands on Skipped rather than on an
+    # accidental Pass built out of mock attributes.
+    factory.get_ai_agent_resilient.return_value = {"aiAgent": {}}
 
 
 def _published_guardrail():
@@ -246,25 +250,118 @@ def test_ai_guardrail_unbound_agent_without_guardrail_does_not_fail(
     assert finding.evidence["unguarded_bound_agent_count"] == 0
 
 
-def test_ai_guardrail_bound_agent_missing_from_list_is_reported_not_failed(
+def test_ai_guardrail_bound_agent_missing_from_list_is_resolved_individually(
     make_check_context, mock_aws_client_factory
 ):
-    # Arrange — absence from ListAIAgents is not evidence of a missing guardrail.
+    # Arrange — a version-pinned binding is absent from ListAIAgents, so the
+    # agent is read directly instead of being left unverified.
     _wire_access_denied(mock_aws_client_factory)
     factory = mock_aws_client_factory
     factory.list_integration_associations_resilient.return_value = _assistant_association()
     factory.list_ai_guardrails_resilient.return_value = _published_guardrail()
-    _bind_agents(factory, ORCHESTRATION="agent-missing")
+    _bind_agents(factory, ORCHESTRATION="agent-pinned:3")
     factory.list_ai_agents_resilient.return_value = {"aiAgentSummaries": []}
+    factory.get_ai_agent_resilient.return_value = {
+        "aiAgent": _agent_summary(
+            "agent-pinned:3",
+            "ORCHESTRATION",
+            "orchestrationAIAgentConfiguration",
+            guardrail_field="orchestrationAIGuardrailId",
+            guardrail_id="g-1",
+        )
+    }
 
     # Act
     finding = AIGuardrailCoverageCheck().execute(make_check_context())
 
     # Assert
     assert finding.status == CheckStatus.PASS
+    factory.get_ai_agent_resilient.assert_called_once_with("a1", "agent-pinned:3")
     observation = finding.evidence["assistant_guardrail_observations"][0]
-    assert observation["bound_agents_not_returned_by_list"] == ["ORCHESTRATION"]
+    assert observation["guarded_bound_agents"][0]["resolved_by"] == "wisdom:GetAIAgent"
+    assert "unresolved_bound_agents" not in observation
     assert finding.evidence["unguarded_bound_agent_count"] == 0
+
+
+def test_ai_guardrail_resolved_agent_without_guardrail_fails(
+    make_check_context, mock_aws_client_factory
+):
+    # Arrange — the individually-read agent has no guardrail. That is a real
+    # attachment gap and must fail, not pass for want of a list entry.
+    _wire_access_denied(mock_aws_client_factory)
+    factory = mock_aws_client_factory
+    factory.list_integration_associations_resilient.return_value = _assistant_association()
+    factory.list_ai_guardrails_resilient.return_value = _published_guardrail()
+    _bind_agents(factory, SELF_SERVICE="agent-pinned:2")
+    factory.list_ai_agents_resilient.return_value = {"aiAgentSummaries": []}
+    factory.get_ai_agent_resilient.return_value = {
+        "aiAgent": _agent_summary(
+            "agent-pinned:2", "SELF_SERVICE", "selfServiceAIAgentConfiguration"
+        )
+    }
+
+    # Act
+    finding = AIGuardrailCoverageCheck().execute(make_check_context())
+
+    # Assert
+    assert finding.status == CheckStatus.FAIL
+    assert finding.evidence["unguarded_bound_agent_count"] == 1
+
+
+def test_ai_guardrail_unresolvable_bound_agent_is_skipped_not_passed(
+    make_check_context, mock_aws_client_factory
+):
+    # Arrange — neither ListAIAgents nor GetAIAgent can read the bound agent.
+    # The claim this check makes is about *every* bound agent, so one agent whose
+    # configuration was never read makes the claim undetermined. Passing here
+    # would be a confident security PASS built on absent evidence.
+    _wire_access_denied(mock_aws_client_factory)
+    factory = mock_aws_client_factory
+    factory.list_integration_associations_resilient.return_value = _assistant_association()
+    factory.list_ai_guardrails_resilient.return_value = _published_guardrail()
+    _bind_agents(factory, ORCHESTRATION="agent-missing")
+    factory.list_ai_agents_resilient.return_value = {"aiAgentSummaries": []}
+    factory.get_ai_agent_resilient.side_effect = _access_denied("GetAIAgent")
+
+    # Act
+    finding = AIGuardrailCoverageCheck().execute(make_check_context())
+
+    # Assert
+    assert finding.status == CheckStatus.SKIPPED
+    assert finding.evidence["required_permission"] == "wisdom:GetAIAgent"
+    observation = finding.evidence["assistants_with_unresolved_bound_agents"][0]
+    assert observation["unresolved_bound_agents"] == [
+        {"agent_type": "ORCHESTRATION", "ai_agent_id": "agent-missing", "reason": "access_denied"}
+    ]
+    # The unverified agent still counts as guardrail-capable, so the evidence
+    # cannot be read as "no agents needed checking".
+    assert observation["guardrail_capable_bound_agents"] == 1
+
+
+def test_ai_guardrail_real_gap_outranks_an_unresolved_agent(
+    make_check_context, mock_aws_client_factory
+):
+    # Arrange — one bound agent has no guardrail, another cannot be read. The
+    # actionable failure is reported rather than masked behind Skipped.
+    _wire_access_denied(mock_aws_client_factory)
+    factory = mock_aws_client_factory
+    factory.list_integration_associations_resilient.return_value = _assistant_association()
+    factory.list_ai_guardrails_resilient.return_value = _published_guardrail()
+    _bind_agents(factory, SELF_SERVICE="agent-1", ORCHESTRATION="agent-missing")
+    factory.list_ai_agents_resilient.return_value = {
+        "aiAgentSummaries": [
+            _agent_summary("agent-1", "SELF_SERVICE", "selfServiceAIAgentConfiguration")
+        ]
+    }
+    factory.get_ai_agent_resilient.side_effect = _access_denied("GetAIAgent")
+
+    # Act
+    finding = AIGuardrailCoverageCheck().execute(make_check_context())
+
+    # Assert
+    assert finding.status == CheckStatus.FAIL
+    assert finding.evidence["unguarded_bound_agent_count"] == 1
+    assert "assistants_with_unresolved_bound_agents" in finding.evidence
 
 
 def test_ai_guardrail_get_assistant_access_denied_returns_skipped(

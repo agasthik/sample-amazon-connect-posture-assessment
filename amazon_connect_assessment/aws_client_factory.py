@@ -593,6 +593,17 @@ class AWSClientFactory:
             **kwargs,
         )
 
+    def get_ai_agent_resilient(self, assistant_id: str, ai_agent_id: str) -> Dict[str, Any]:
+        """Read one Q in Connect AI agent, including a version-qualified ID."""
+        client = self.get_qconnect_client()
+        return self.call_api_with_resilience(
+            client,
+            "get_ai_agent",
+            "qconnect",
+            assistantId=assistant_id,
+            aiAgentId=ai_agent_id,
+        )
+
     def list_ai_prompts_resilient(self, assistant_id: str, **kwargs) -> Dict[str, Any]:
         """List assistant-scoped Q in Connect AI prompts with resilience."""
         client = self.get_qconnect_client()

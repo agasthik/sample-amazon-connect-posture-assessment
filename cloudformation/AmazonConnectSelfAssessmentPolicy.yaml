@@ -287,6 +287,9 @@ Resources:
             Effect: Allow
             Action:
               # qconnect is the boto3 service name; wisdom is the IAM prefix.
+              # GetAIAgent resolves a bound agent that ListAIAgents omits
+              # (version-pinned or SYSTEM).
+              - wisdom:GetAIAgent
               - wisdom:GetAssistant
               - wisdom:GetKnowledgeBase
               - wisdom:ListAIAgents

@@ -224,6 +224,39 @@ def _unguarded_bound_agents(
     return guarded, unguarded, unresolved
 
 
+def _resolve_bound_agent(
+    factory: Any, assistant_id: str, agent_type: str, agent_id: str
+) -> Dict[str, Any]:
+    """
+    Read one bound agent directly, for agents ``ListAIAgents`` does not return.
+
+    A version-pinned binding (``<id>:<version>``) or a SYSTEM agent is absent
+    from the list response, so the list alone cannot say whether that agent
+    references a guardrail. ``GetAIAgent`` accepts the qualified ID and answers
+    for the exact revision the assistant serves traffic with — matching on the
+    unqualified base ID instead would report the current draft's configuration,
+    not the pinned one.
+    """
+    response = factory.get_ai_agent_resilient(assistant_id, agent_id)
+    detail = response.get("aiAgent") or {}
+    if not detail:
+        raise _IncompleteCollectionError(
+            operation="wisdom:GetAIAgent",
+            reason="agent_detail_empty",
+        )
+    # The binding key is itself the agent type, so it is the correct fallback
+    # when the detail response omits the field.
+    typed = {**detail, "type": detail.get("type") or agent_type}
+    return {
+        "agent_type": agent_type,
+        "ai_agent_id": agent_id,
+        "ai_agent_name": detail.get("name"),
+        "origin": detail.get("origin"),
+        "guardrail_id": _guardrail_id_for_agent(typed),
+        "resolved_by": "wisdom:GetAIAgent",
+    }
+
+
 def _list_prompts(factory: Any, assistant_id: str) -> List[Dict[str, Any]]:
     return _collect_paginated(
         lambda **kwargs: factory.list_ai_prompts_resilient(assistant_id, **kwargs),
@@ -407,6 +440,7 @@ class AIGuardrailCoverageCheck(BaseCheck):
 
         uncovered: List[Dict[str, Any]] = []
         attachment_gaps: List[Dict[str, Any]] = []
+        unverifiable: List[Dict[str, Any]] = []
         observations: List[Dict[str, Any]] = []
         for assistant_index, arn in enumerate(assistant_arns):
             assistant_id = _id_from_arn(arn)
@@ -434,6 +468,31 @@ class AIGuardrailCoverageCheck(BaseCheck):
 
             guarded, unguarded, unresolved = _unguarded_bound_agents(bound_agents, agent_summaries)
 
+            # A bound agent the list call did not return is read individually.
+            # Anything still unresolved after that is recorded and later blocks a
+            # PASS: the claim this check makes is about every bound agent, so one
+            # agent whose configuration was never read makes that claim
+            # unverifiable rather than satisfied.
+            unresolved_records: List[Dict[str, Any]] = []
+            for agent_type in unresolved:
+                agent_id = bound_agents[agent_type]
+                try:
+                    record = _resolve_bound_agent(factory, assistant_id, agent_type, agent_id)
+                except Exception as error:  # noqa: BLE001 - recorded, never treated as healthy
+                    unresolved_records.append(
+                        {
+                            "agent_type": agent_type,
+                            "ai_agent_id": agent_id,
+                            "reason": (
+                                "access_denied"
+                                if factory.is_access_denied(error)
+                                else type(error).__name__
+                            ),
+                        }
+                    )
+                    continue
+                (guarded if record["guardrail_id"] else unguarded).append(record)
+
             qualifying = [
                 guardrail
                 for guardrail in guardrails
@@ -454,17 +513,23 @@ class AIGuardrailCoverageCheck(BaseCheck):
                 "active_published_count": len(qualifying),
                 "observed_states": states,
                 "bound_agent_count": len(bound_agents),
-                "guardrail_capable_bound_agents": len(guarded) + len(unguarded),
+                "guardrail_capable_bound_agents": (
+                    len(guarded) + len(unguarded) + len(unresolved_records)
+                ),
                 "guarded_bound_agents": guarded,
                 "unguarded_bound_agents": unguarded,
             }
             if unresolved:
                 observation["bound_agents_not_returned_by_list"] = unresolved
+            if unresolved_records:
+                observation["unresolved_bound_agents"] = unresolved_records
             observations.append(observation)
             if unguarded:
                 attachment_gaps.append(observation)
             if not qualifying:
                 uncovered.append(observation)
+            if unresolved_records:
+                unverifiable.append(observation)
 
         unguarded_total = sum(len(item["unguarded_bound_agents"]) for item in observations)
         limitation = (
@@ -479,7 +544,7 @@ class AIGuardrailCoverageCheck(BaseCheck):
             "unguarded_bound_agent_count": unguarded_total,
             "evidence_limitation": limitation,
         }
-        if not uncovered and not attachment_gaps:
+        if not uncovered and not attachment_gaps and not unverifiable:
             return self.create_finding(
                 status=CheckStatus.PASS,
                 resource_id=instance.instance_id,
@@ -496,6 +561,27 @@ class AIGuardrailCoverageCheck(BaseCheck):
             evidence["assistants_without_active_published_guardrail"] = uncovered
         if attachment_gaps:
             evidence["assistants_with_unguarded_bound_agents"] = attachment_gaps
+        if unverifiable:
+            evidence["assistants_with_unresolved_bound_agents"] = unverifiable
+
+        # An unresolved agent only decides the outcome when nothing else already
+        # does. A real attachment gap or an assistant with no published guardrail
+        # is actionable now and outranks the unverified remainder.
+        if unverifiable and not uncovered and not attachment_gaps:
+            unresolved_total = sum(len(item["unresolved_bound_agents"]) for item in unverifiable)
+            return self.create_finding(
+                status=CheckStatus.SKIPPED,
+                resource_id=instance.instance_id,
+                resource_type="QConnectAssistant",
+                description=(
+                    f"Skipped: {unresolved_total} bound AI agent(s) across "
+                    f"{len(unverifiable)} assistant(s) could not be read through "
+                    "wisdom:ListAIAgents or wisdom:GetAIAgent, so whether every bound agent "
+                    "references a guardrail is undetermined. Reported as Skipped rather than "
+                    f"Pass because the evidence is incomplete, not clean. {limitation}"
+                ),
+                evidence={**evidence, "required_permission": "wisdom:GetAIAgent"},
+            )
 
         if attachment_gaps:
             headline = (

@@ -43,7 +43,7 @@ Run `amazon-connect-assessment --list-checks` for the live list at any time.
 | `sec-sensitive-data-001` | High | Contact flows don't store PII or credentials in contact attributes (visible in CTRs and logs) |
 | `sec-pii-prompts-001` | High | Flows don't read back sensitive customer data (account numbers, SSN) in voice without masking |
 | `sec-excessive-agency-001` | High | Lambda functions invoked by contact flows don't have overly broad execution role permissions |
-| `ai-ops-guardrail-001` | High | Each associated Q in Connect assistant exposes at least one guardrail summary that is both ACTIVE and PUBLISHED, **and** every AI agent bound to that assistant references a guardrail in its own configuration. Attachment is read from `GetAssistant.aiAgentConfiguration` (the agents actually serving traffic) joined to each agent's `*AIGuardrailId` in `ListAIAgents`. The three `EMAIL_*` agent types have no guardrail member in the API, so they are excluded rather than failed. Does not prove which content, denied-topic, word, or sensitive-information filters a referenced guardrail applies. |
+| `ai-ops-guardrail-001` | High | Each associated Q in Connect assistant exposes at least one guardrail summary that is both ACTIVE and PUBLISHED, **and** every AI agent bound to that assistant references a guardrail in its own configuration. Attachment is read from `GetAssistant.aiAgentConfiguration` (the agents actually serving traffic) joined to each agent's `*AIGuardrailId` in `ListAIAgents`. A version-pinned or SYSTEM binding that `ListAIAgents` does not return is read individually with `GetAIAgent`; if it still cannot be read the check is **Skipped**, never Passed, because the claim it makes covers every bound agent. The three `EMAIL_*` agent types have no guardrail member in the API, so they are excluded rather than failed. Does not prove which content, denied-topic, word, or sensitive-information filters a referenced guardrail applies. |
 | `security-data-001` | Medium | Data retention policies, access logging, and privacy controls are configured |
 | `sec-lambda-validation-001` | Medium | Contact flows that branch on Lambda return values validate the response shape before branching |
 | `sec-lex-convlogs-001` | Medium | Amazon Lex V2 conversation logging for the bots associated with the instance. FAILs when audio logging writes caller recordings to S3 with no `kmsKeyArn`, so access to the recordings is not gated by a key policy you control. Text logging is reported as inventory, not judged: `CloudWatchLogGroupLogDestination` has no KMS member, so whether the log group is encrypted is not knowable from Lex — the finding says so and points at `logs:DescribeLogGroups`. Returns Not Applicable when no Lex V2 bot is associated, naming any Lex V1 bot found. **Lex V1 conversation logs are not evaluated.** |
@@ -83,8 +83,8 @@ Run `amazon-connect-assessment --list-checks` for the live list at any time.
 | `res-acgr-numbers-001` | High | When ACGR is configured, inbound phone numbers are claimed against a TDG ARN rather than the instance ARN. Numbers bound directly to the instance do not fail over. |
 | `res-cloudwatch-001` | High | CloudWatch alarms exist for critical Connect metrics (ConcurrentCalls, ThrottledCalls, MissedCalls, CallsPerInterval) |
 | `res-quota-headroom-001` | High | Peak concurrent calls over the last 30 days against the concurrent-active-calls quota. Fails above 80% utilization and escalates to Critical above 95%. **Not Applicable** when the instance carried no call traffic in the window. |
-| `res-quota-growth-001` | Medium | Least-squares trend on weekly peak concurrent calls over 90 days, projected against the concurrent-calls quota. Fails when the ceiling is within 26 weeks (High within 13). **Not Applicable** below four weeks of data, because a trend fitted to less than that means nothing. |
-| `res-quota-config-001` | Medium | Users, queues, routing profiles, security profiles, flows, and claimed phone numbers against their per-instance quotas. Fails above 80% utilization on any of them. An empty collection is reported as *unmeasured* rather than as 0% — a count of zero means discovery was denied, not that the instance is empty. |
+| `res-quota-growth-001` | Medium | Least-squares trend on weekly peak concurrent calls over 90 days, projected against the concurrent-calls quota. The trend is fitted against each week's elapsed index, so a week with no datapoint widens the span rather than counting as the next consecutive week. Fails when the ceiling is within 26 weeks (High within 13). **Not Applicable** below four weeks of data, because a trend fitted to less than that means nothing. |
+| `res-quota-config-001` | Medium | Users, queues, routing profiles, security profiles, flows, and claimed phone numbers against their per-instance quotas. Fails above 80% utilization on any of them. Users are counted from `connect:ListUsers` and claimed numbers from `connect:ListPhoneNumbersV2`; the rest come from instance discovery, where an empty collection is reported as *unmeasured* rather than as 0% — a count of zero there means discovery was denied, not that the instance is empty. |
 | `res-flow-errors-001` | High | Error-capable actions in contact flows have defined error transitions (no dead-end paths) |
 | `res-carrier-diversity-001` | Medium | Phone numbers span more than one country, or a traffic distribution group is present. FAIL remediation points to Amazon Connect Global Resiliency (ACGR) rather than claiming numbers in another country, which is rarely realistic |
 | `res-flow-loops-001` | Medium | No unbounded cycle patterns in contact flows that could trap callers |
@@ -230,13 +230,14 @@ Common permissions that cause skips if missing:
 | `connect:DescribeTrafficDistributionGroup` | `res-acgr-tdg-status-001` |
 | `connect:GetTrafficDistribution` | `res-acgr-traffic-dist-001` |
 | `connect:ListPhoneNumbersV2`, `connect:ListFlowAssociations` | `journey-sec-001`, `journey-cost-001`, `journey-res-001`, `journey-scope-001` |
+| `connect:ListUsers` | `res-quota-config-001` |
 | `connect:ListIntegrationAssociations` | all six `ai-ops-*` checks |
 | `connect:ListBots`, `lex:DescribeBotAlias` | `sec-lex-convlogs-001` |
 | `iam:GetRolePolicy` | `sec-iam-deep-001`, `sec-excessive-agency-001` |
 | `lambda:GetPolicy` | `sec-excessive-agency-001` |
 | `lambda:GetFunction` | `res-lambda-dependency-001` |
 | `kms:DescribeKey` | `sec-storage-001` |
-| `wisdom:ListAIAgents`, `wisdom:ListAIGuardrails` | `ai-ops-guardrail-001` |
+| `wisdom:ListAIAgents`, `wisdom:ListAIGuardrails`, `wisdom:GetAIAgent` | `ai-ops-guardrail-001` |
 | `wisdom:GetAssistant` | `ai-ops-encryption-001` |
 | `wisdom:GetKnowledgeBase` | `ai-ops-encryption-001`, `ai-ops-kb-sync-001` |
 | `wisdom:ListAIPrompts` | `ai-ops-model-cost-001` |

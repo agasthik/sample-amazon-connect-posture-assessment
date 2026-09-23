@@ -266,6 +266,11 @@ POLICY_STATEMENTS: List[Dict[str, object]] = [
     _statement(
         "QConnectAIOpsReadAccess",
         [
+            # Resolves a bound AI agent that ListAIAgents does not return — a
+            # version-pinned or SYSTEM agent. Without it the guardrail check
+            # cannot read that agent's configuration and degrades to Skipped
+            # rather than reporting coverage it has not verified.
+            "wisdom:GetAIAgent",
             "wisdom:GetAssistant",
             "wisdom:GetKnowledgeBase",
             "wisdom:ListAIAgents",

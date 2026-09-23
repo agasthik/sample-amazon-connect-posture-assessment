@@ -175,6 +175,7 @@
             "Sid": "QConnectAIOpsReadAccess",
             "Effect": "Allow",
             "Action": [
+                "wisdom:GetAIAgent",
                 "wisdom:GetAssistant",
                 "wisdom:GetKnowledgeBase",
                 "wisdom:ListAIAgents",

@@ -8,24 +8,23 @@ from amazon_connect_assessment.checks.contact_flow_security_checks import (
     DynamicPromptInjectionCheck,
     ExternalTransferTollFraudCheck,
     LambdaResponseValidationCheck,
-    OutputHandlingInjectionCheck,
     PIIInPromptsCheck,
     SensitiveDataInAttributesCheck,
     register_contact_flow_security_checks,
 )
 from amazon_connect_assessment.checks.registry import CheckRegistry
-from amazon_connect_assessment.models import CheckStatus, ContactFlow
+from amazon_connect_assessment.models import CheckStatus, ContactFlow, Severity
 from tests.conftest import build_action, build_contact_flow
 
 
-def _instance_with_flow(instance, flow_json, name="TestFlow"):
+def _instance_with_flow(instance, flow_json, name="TestFlow", flow_type="CONTACT_FLOW"):
     """Attach a single parsed flow to the instance fixture."""
     instance.contact_flows = [
         ContactFlow(
             id="f1",
             arn="arn:aws:connect:us-east-1:123:instance/i/flow/f1",
             name=name,
-            type="CONTACT_FLOW",
+            type=flow_type,
             state="ACTIVE",
             content=flow_json,
         )
@@ -53,6 +52,73 @@ class TestDynamicPromptInjection:
         inst = _instance_with_flow(sample_connect_instance, flow)
         finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
         assert finding.status == CheckStatus.PASS
+
+    # --- Severity tiers. The check previously reported every dynamic
+    # reference as HIGH "prompt injection". Only a prompt Polly interprets
+    # as SSML actually parses markup out of the substituted value; a
+    # plain-text prompt spoken back to the caller who supplied the value has
+    # no injection path at all. These pin that distinction down so the
+    # single-severity behaviour cannot creep back. ---
+
+    def test_ssml_prompt_is_high(self, make_check_context, sample_connect_instance):
+        flow = build_contact_flow(
+            [build_action("a1", "MessageParticipant", {"SSML": "Hello $.Attributes.Name"})]
+        )
+        inst = _instance_with_flow(sample_connect_instance, flow)
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
+        assert finding.status == CheckStatus.FAIL
+        assert finding.severity == Severity.HIGH
+        assert finding.evidence["flagged_prompts"][0]["interpreted_as"] == "ssml"
+
+    def test_texttype_discriminator_is_honoured(self, make_check_context, sample_connect_instance):
+        flow = build_contact_flow(
+            [
+                build_action(
+                    "a1",
+                    "MessageParticipant",
+                    {"Text": "Hello $.Attributes.Name", "TextType": "ssml"},
+                )
+            ]
+        )
+        inst = _instance_with_flow(sample_connect_instance, flow)
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
+        assert finding.severity == Severity.HIGH
+
+    def test_plain_text_to_caller_is_low(self, make_check_context, sample_connect_instance):
+        """No markup parsing, and the caller hears back their own value."""
+        flow = build_contact_flow(
+            [build_action("a1", "MessageParticipant", {"Text": "Hello $.Attributes.Name"})]
+        )
+        inst = _instance_with_flow(sample_connect_instance, flow)
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
+        assert finding.status == CheckStatus.FAIL
+        assert finding.severity == Severity.LOW
+        assert finding.evidence["flagged_prompts"][0]["risk_tier"] == "spoken_to_source"
+
+    def test_plain_text_in_agent_whisper_is_medium(
+        self, make_check_context, sample_connect_instance
+    ):
+        """Audience is the agent, so caller-authored text can mislead them."""
+        flow = build_contact_flow(
+            [build_action("a1", "MessageParticipant", {"Text": "Caller said $.Attributes.Reason"})]
+        )
+        inst = _instance_with_flow(sample_connect_instance, flow, flow_type="AGENT_WHISPER")
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
+        assert finding.severity == Severity.MEDIUM
+        assert finding.evidence["flagged_prompts"][0]["risk_tier"] == "other_audience"
+
+    def test_worst_tier_sets_finding_severity(self, make_check_context, sample_connect_instance):
+        """One SSML prompt must not be diluted by harmless plain-text ones."""
+        flow = build_contact_flow(
+            [
+                build_action("a1", "MessageParticipant", {"Text": "Hi $.Attributes.Name"}),
+                build_action("a2", "MessageParticipant", {"SSML": "Hi $.Attributes.Name"}),
+            ]
+        )
+        inst = _instance_with_flow(sample_connect_instance, flow)
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
+        assert finding.severity == Severity.HIGH
+        assert len(finding.evidence["flagged_prompts"]) == 2
 
     # --- Reviewer feedback: system attributes (queue name, agent name,
     # etc) are Connect-populated/admin-configured and a caller cannot
@@ -278,46 +344,6 @@ class TestPIIInPrompts:
         assert finding.status == CheckStatus.PASS
 
 
-# --- Output handling injection (sec-output-handling-001) ---
-
-
-class TestOutputHandlingInjection:
-    def test_lambda_to_prompt_with_dynamic_ref_fails(
-        self, make_check_context, sample_connect_instance
-    ):
-        flow = build_contact_flow(
-            [
-                build_action(
-                    "a1",
-                    "InvokeLambdaFunction",
-                    {"FunctionArn": "arn:...:fn"},
-                    next_action="a2",
-                ),
-                build_action("a2", "MessageParticipant", {"Text": "Result: $.External.result"}),
-            ]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = OutputHandlingInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.FAIL
-        assert "injection" in finding.description.lower()
-
-    def test_lambda_to_static_prompt_passes(self, make_check_context, sample_connect_instance):
-        flow = build_contact_flow(
-            [
-                build_action(
-                    "a1",
-                    "InvokeLambdaFunction",
-                    {"FunctionArn": "arn:...:fn"},
-                    next_action="a2",
-                ),
-                build_action("a2", "MessageParticipant", {"Text": "Thank you, processing."}),
-            ]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = OutputHandlingInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.PASS
-
-
 # --- Registration ---
 
 
@@ -331,6 +357,5 @@ def test_register_contact_flow_security_checks():
         "sec-toll-fraud-001",
         "sec-sensitive-data-001",
         "sec-pii-prompts-001",
-        "sec-output-handling-001",
     }
     assert expected <= ids

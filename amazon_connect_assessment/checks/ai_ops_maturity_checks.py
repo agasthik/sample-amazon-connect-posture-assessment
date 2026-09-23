@@ -32,6 +32,28 @@ _KB_TRANSIENT_OR_INACTIVE_STATUSES = {
 }
 _KB_TRANSIENT_INGESTION_STATUSES = {"SYNCING_IN_PROGRESS", "CREATE_IN_PROGRESS"}
 
+# Each AI agent type carries its guardrail on a differently-named member of its
+# own configuration variant (the qconnect AIAgentConfiguration union). The three
+# EMAIL_* variants have no guardrail member at all, so an email agent without a
+# guardrail is not a finding — it is a configuration that cannot express one,
+# and failing it would be indistinguishable from a real gap.
+_AGENT_CONFIG_KEY_BY_TYPE = {
+    "MANUAL_SEARCH": "manualSearchAIAgentConfiguration",
+    "ANSWER_RECOMMENDATION": "answerRecommendationAIAgentConfiguration",
+    "SELF_SERVICE": "selfServiceAIAgentConfiguration",
+    "ORCHESTRATION": "orchestrationAIAgentConfiguration",
+    "NOTE_TAKING": "noteTakingAIAgentConfiguration",
+    "CASE_SUMMARIZATION": "caseSummarizationAIAgentConfiguration",
+}
+_GUARDRAIL_FIELD_BY_TYPE = {
+    "MANUAL_SEARCH": "answerGenerationAIGuardrailId",
+    "ANSWER_RECOMMENDATION": "answerGenerationAIGuardrailId",
+    "SELF_SERVICE": "selfServiceAIGuardrailId",
+    "ORCHESTRATION": "orchestrationAIGuardrailId",
+    "NOTE_TAKING": "noteTakingAIGuardrailId",
+    "CASE_SUMMARIZATION": "caseSummarizationAIGuardrailId",
+}
+
 
 @dataclass
 class _IncompleteCollectionError(Exception):
@@ -134,6 +156,74 @@ def _list_guardrails(factory: Any, assistant_id: str) -> List[Dict[str, Any]]:
     )
 
 
+def _list_ai_agents(factory: Any, assistant_id: str) -> List[Dict[str, Any]]:
+    return _collect_paginated(
+        lambda **kwargs: factory.list_ai_agents_resilient(assistant_id, **kwargs),
+        operation="wisdom:ListAIAgents",
+        items_key="aiAgentSummaries",
+        response_token_key="nextToken",
+        request_token_key="nextToken",
+        request_page_size_key="maxResults",
+    )
+
+
+def _assistant_agent_ids(factory: Any, assistant_id: str) -> Dict[str, str]:
+    """Map AI agent type to the agent ID the assistant actually serves traffic with.
+
+    ``GetAssistant`` reports only the agents currently bound to the assistant.
+    An agent that exists but is not bound cannot affect a caller, so binding is
+    what makes a missing guardrail consequential.
+    """
+    response = factory.get_qconnect_assistant_resilient(assistant_id)
+    configuration = (response.get("assistant") or {}).get("aiAgentConfiguration") or {}
+    bound: Dict[str, str] = {}
+    for agent_type, entry in configuration.items():
+        agent_id = (entry or {}).get("aiAgentId")
+        if agent_id:
+            bound[agent_type] = agent_id
+    return bound
+
+
+def _guardrail_id_for_agent(summary: Dict[str, Any]) -> Optional[str]:
+    """Read an agent summary's guardrail ID, or None when its type supports one but has none."""
+    agent_type = summary.get("type")
+    config_key = _AGENT_CONFIG_KEY_BY_TYPE.get(str(agent_type))
+    if not config_key:
+        return None
+    variant = (summary.get("configuration") or {}).get(config_key) or {}
+    guardrail_id = variant.get(_GUARDRAIL_FIELD_BY_TYPE[str(agent_type)])
+    return str(guardrail_id) if guardrail_id else None
+
+
+def _unguarded_bound_agents(
+    bound: Dict[str, str], summaries: List[Dict[str, Any]]
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    """Split bound guardrail-capable agents into guarded, unguarded, and unresolved."""
+    by_id = {str(item.get("aiAgentId")): item for item in summaries if item.get("aiAgentId")}
+    guarded: List[Dict[str, Any]] = []
+    unguarded: List[Dict[str, Any]] = []
+    unresolved: List[str] = []
+    for agent_type, agent_id in sorted(bound.items()):
+        if agent_type not in _GUARDRAIL_FIELD_BY_TYPE:
+            continue
+        summary = by_id.get(agent_id)
+        if summary is None:
+            # ListAIAgents did not return the bound agent (a version-pinned or
+            # SYSTEM agent can be bound without appearing). Absence is not
+            # evidence of a missing guardrail, so report it separately.
+            unresolved.append(agent_type)
+            continue
+        record = {
+            "agent_type": agent_type,
+            "ai_agent_id": agent_id,
+            "ai_agent_name": summary.get("name"),
+            "origin": summary.get("origin"),
+            "guardrail_id": _guardrail_id_for_agent(summary),
+        }
+        (guarded if record["guardrail_id"] else unguarded).append(record)
+    return guarded, unguarded, unresolved
+
+
 def _list_prompts(factory: Any, assistant_id: str) -> List[Dict[str, Any]]:
     return _collect_paginated(
         lambda **kwargs: factory.list_ai_prompts_resilient(assistant_id, **kwargs),
@@ -229,19 +319,72 @@ def _skipped_for_detail_error(
     )
 
 
+def _guardrail_remediation_steps(
+    attachment_gaps: List[Dict[str, Any]], uncovered: List[Dict[str, Any]]
+) -> List[RemediationStep]:
+    """Order remediation so the decidable attachment gap is addressed first."""
+    steps: List[RemediationStep] = []
+    if attachment_gaps:
+        named = ", ".join(
+            f"{record['agent_type']} ({record['ai_agent_id']})"
+            for item in attachment_gaps
+            for record in item["unguarded_bound_agents"]
+        )
+        steps.append(
+            RemediationStep(
+                order=len(steps) + 1,
+                instruction=(
+                    "Set a published AI guardrail on each bound agent that has none: "
+                    f"{named}. Use UpdateAIAgent on the agent's own configuration; binding a "
+                    "guardrail to the assistant does not apply it to an agent."
+                ),
+                console_path=(
+                    "Connect Customer admin website -> AI agent designer -> AI agents -> "
+                    "select the agent -> AI guardrail"
+                ),
+            )
+        )
+    if uncovered:
+        steps.append(
+            RemediationStep(
+                order=len(steps) + 1,
+                instruction=(
+                    "For each assistant with no ACTIVE and PUBLISHED guardrail, create or repair "
+                    "one and publish it so ListAIGuardrails reports ACTIVE/PUBLISHED. A saved "
+                    "draft cannot be attached."
+                ),
+                console_path=(
+                    "Connect Customer admin website -> AI agent designer -> AI guardrails"
+                ),
+            )
+        )
+    steps.append(
+        RemediationStep(
+            order=len(steps) + 1,
+            instruction=(
+                "Configure the guardrail's content, denied-topic, word, and "
+                "sensitive-information filters for the workload's requirements. This check "
+                "verifies that a guardrail is referenced, not what it blocks."
+            ),
+        )
+    )
+    return steps
+
+
 class AIGuardrailCoverageCheck(BaseCheck):
     """Check for an ACTIVE and PUBLISHED guardrail in each assistant scope."""
 
     def __init__(self) -> None:
         super().__init__(
             check_id="ai-ops-guardrail-001",
-            name="Q in Connect AI Guardrail Availability",
+            name="Q in Connect AI Guardrail Coverage",
             pillar=Pillar.SECURITY,
             severity=Severity.HIGH,
             description=(
-                "Checks whether each Q in Connect assistant exposes at least one ACTIVE and "
-                "PUBLISHED AI guardrail. This evidence does not establish AI-agent attachment "
-                "or the guardrail's configured filter categories."
+                "Checks whether each Q in Connect assistant exposes an ACTIVE and PUBLISHED AI "
+                "guardrail, and whether every AI agent bound to that assistant references a "
+                "guardrail in its own configuration. This evidence does not establish which "
+                "filter categories a referenced guardrail applies."
             ),
         )
 
@@ -263,19 +406,33 @@ class AIGuardrailCoverageCheck(BaseCheck):
             )
 
         uncovered: List[Dict[str, Any]] = []
+        attachment_gaps: List[Dict[str, Any]] = []
         observations: List[Dict[str, Any]] = []
         for assistant_index, arn in enumerate(assistant_arns):
             assistant_id = _id_from_arn(arn)
+            progress = {"assistant_id": assistant_id, "assistants_evaluated": assistant_index}
             try:
                 guardrails = _list_guardrails(factory, assistant_id)
             except _IncompleteCollectionError as error:
                 return _skipped_for_incomplete_collection(
-                    self,
-                    context,
-                    error,
-                    "wisdom:ListAIGuardrails",
-                    {"assistant_id": assistant_id, "assistants_evaluated": assistant_index},
+                    self, context, error, "wisdom:ListAIGuardrails", progress
                 )
+
+            try:
+                bound_agents = _assistant_agent_ids(factory, assistant_id)
+            except Exception as error:  # noqa: BLE001 - reported, never treated as healthy
+                return _skipped_for_detail_error(
+                    self, context, error, "wisdom:GetAssistant", "wisdom:GetAssistant", progress
+                )
+
+            try:
+                agent_summaries = _list_ai_agents(factory, assistant_id)
+            except _IncompleteCollectionError as error:
+                return _skipped_for_incomplete_collection(
+                    self, context, error, "wisdom:ListAIAgents", progress
+                )
+
+            guarded, unguarded, unresolved = _unguarded_bound_agents(bound_agents, agent_summaries)
 
             qualifying = [
                 guardrail
@@ -296,71 +453,89 @@ class AIGuardrailCoverageCheck(BaseCheck):
                 "guardrail_count": len(guardrails),
                 "active_published_count": len(qualifying),
                 "observed_states": states,
+                "bound_agent_count": len(bound_agents),
+                "guardrail_capable_bound_agents": len(guarded) + len(unguarded),
+                "guarded_bound_agents": guarded,
+                "unguarded_bound_agents": unguarded,
             }
+            if unresolved:
+                observation["bound_agents_not_returned_by_list"] = unresolved
             observations.append(observation)
+            if unguarded:
+                attachment_gaps.append(observation)
             if not qualifying:
                 uncovered.append(observation)
 
+        unguarded_total = sum(len(item["unguarded_bound_agents"]) for item in observations)
         limitation = (
-            "ListAIGuardrails proves assistant-scoped availability only; it does not prove "
-            "attachment to or enforcement by every AI agent, or which content/PII filters are "
-            "configured. Review those controls separately."
+            "Guardrail attachment is read from each bound AI agent's configuration. The three "
+            "EMAIL_* agent types have no guardrail member and are excluded rather than failed. "
+            "This evidence does not establish which content, denied-topic, word, or "
+            "sensitive-information filters a referenced guardrail actually applies."
         )
         evidence = {
             "assistants_checked": len(assistant_arns),
             "assistant_guardrail_observations": observations,
+            "unguarded_bound_agent_count": unguarded_total,
             "evidence_limitation": limitation,
         }
-        if not uncovered:
+        if not uncovered and not attachment_gaps:
             return self.create_finding(
                 status=CheckStatus.PASS,
                 resource_id=instance.instance_id,
                 resource_type="QConnectAssistant",
                 description=(
                     f"All {len(assistant_arns)} Q in Connect assistant(s) expose at least one "
-                    f"ACTIVE and PUBLISHED AI guardrail. {limitation}"
+                    "ACTIVE and PUBLISHED AI guardrail, and every bound AI agent whose type "
+                    f"supports a guardrail references one. {limitation}"
                 ),
                 evidence=evidence,
             )
 
-        evidence["assistants_without_active_published_guardrail"] = uncovered
-        return self.create_finding(
-            status=CheckStatus.FAIL,
-            resource_id=instance.instance_id,
-            resource_type="QConnectAssistant",
-            description=(
+        if uncovered:
+            evidence["assistants_without_active_published_guardrail"] = uncovered
+        if attachment_gaps:
+            evidence["assistants_with_unguarded_bound_agents"] = attachment_gaps
+
+        if attachment_gaps:
+            headline = (
+                f"{unguarded_total} AI agent(s) bound to "
+                f"{len(attachment_gaps)} of {len(assistant_arns)} Q in Connect assistant(s) "
+                "serve traffic with no AI guardrail referenced in their configuration"
+            )
+            if uncovered:
+                headline += (
+                    f", and {len(uncovered)} assistant(s) expose no ACTIVE and PUBLISHED "
+                    "guardrail at all"
+                )
+            description = (
+                f"{headline}. A bound agent is one the assistant actually routes to, so an "
+                "absent guardrail reference means model output reaches agents or callers "
+                f"unfiltered. {limitation}"
+            )
+            flagged = [item["assistant_arn"] for item in attachment_gaps]
+        else:
+            description = (
                 f"{len(uncovered)} of {len(assistant_arns)} Q in Connect assistant(s) do not "
                 "expose an AI guardrail that is both ACTIVE and PUBLISHED. Saved drafts and "
                 "guardrails that are creating, failed, deleting, or deleted do not count as "
                 f"published-active coverage. {limitation}"
-            ),
+            )
+            flagged = [item["assistant_arn"] for item in uncovered]
+
+        return self.create_finding(
+            status=CheckStatus.FAIL,
+            resource_id=instance.instance_id,
+            resource_type="QConnectAssistant",
+            description=description,
             evidence=evidence,
             structured_remediation=Remediation(
                 summary=(
-                    "Create or repair and publish an AI guardrail, then separately verify its "
-                    "agent attachment and filter configuration."
+                    "Attach a published AI guardrail to every bound AI agent, then confirm the "
+                    "guardrail's filter categories match the workload."
                 ),
-                target_resources=[item["assistant_arn"] for item in uncovered],
-                steps=[
-                    RemediationStep(
-                        order=1,
-                        instruction=(
-                            "For each flagged assistant, create or repair an AI guardrail and "
-                            "publish it so ListAIGuardrails reports ACTIVE/PUBLISHED."
-                        ),
-                        console_path=(
-                            "Connect Customer admin website -> AI agent designer -> AI guardrails"
-                        ),
-                    ),
-                    RemediationStep(
-                        order=2,
-                        instruction=(
-                            "Separately review AI-agent orchestration attachment and configure "
-                            "content, denied-topic, word, and sensitive-information filters for "
-                            "the workload's requirements; this list API does not verify them."
-                        ),
-                    ),
-                ],
+                target_resources=flagged,
+                steps=_guardrail_remediation_steps(attachment_gaps, uncovered),
                 references=[
                     RemediationReference(
                         title="Create AI guardrails for AI agents",

@@ -4,12 +4,11 @@ Contact-flow security checks (Phase 2 / Task 5).
 These checks parse contact flow JSON content (via the parser package) and
 detect security vulnerabilities in the flow logic:
 
-- sec-prompt-inject-001       : Dynamic prompt injection risk
+- sec-prompt-inject-001       : SSML markup / spoken-content injection in prompts
 - sec-lambda-validation-001   : Lambda response used for branching without validation
 - sec-toll-fraud-001          : External transfer to dynamic phone number (toll fraud)
 - sec-sensitive-data-001      : Sensitive data stored in contact attributes
 - sec-pii-prompts-001         : PII read back in voice prompts without masking
-- sec-output-handling-001     : External output piped to actions without sanitization
 
 Each check operates on a parsed ContactFlowGraph derived from the flow content.
 """
@@ -54,16 +53,6 @@ _SENSITIVE_ATTR_PATTERNS = (
     "taxid",
     "passportnumber",
 )
-
-# Action types that collect external/untrusted data.
-_EXTERNAL_DATA_ACTIONS = {
-    "InvokeLambdaFunction",
-    "ConnectToLexBot",
-    "ConnectParticipantWithLexBot",
-    "GetParticipantInput",
-    "GetUserInput",
-    "StoreUserInput",
-}
 
 # Transfer-to-phone-number action type variants.
 _PHONE_TRANSFER_TYPES = {
@@ -144,6 +133,48 @@ def _is_system_attribute_reference(value: str) -> bool:
     return any(lowered.startswith(root) for root in _SYSTEM_ATTRIBUTE_ROOTS)
 
 
+# Flow types whose prompts are spoken to somebody other than the caller who
+# supplied the value. This is the difference between a caller injecting text
+# into their own call — where they are both attacker and audience, which is
+# not an attack — and injecting text that an *agent* then hears as though the
+# platform authored it.
+_OTHER_AUDIENCE_FLOW_TYPES = {
+    "AGENT_WHISPER",
+    "OUTBOUND_WHISPER",
+    "AGENT_HOLD",
+    "AGENT_TRANSFER",
+}
+
+
+def _prompt_text_and_markup(action: FlowAction) -> tuple[str, bool]:
+    """
+    Return ``(text, interpreted_as_ssml)`` for a prompt-playing action.
+
+    This distinction decides whether markup in a substituted value is
+    *parsed* or merely *spoken*, which is the difference between an
+    injection vulnerability and a cosmetic oddity. Amazon Connect emits the
+    flow designer's "Interpret as" choice as a separate parameter key —
+    ``SSML`` for SSML, ``Text`` for plain text — so the key that carries the
+    string also tells us how Polly will treat it.
+
+    Some flow revisions additionally carry an explicit discriminator
+    (``TextType``, the name Polly's own API uses, or ``InterpretAs``). Both
+    are honoured when present so a flow that spells it out is not misread.
+    The fallback is plain text, which is the flow designer's default and the
+    safer assumption to make: it under-states severity rather than inventing
+    a markup-parsing vulnerability that isn't there.
+    """
+    params = action.parameters or {}
+
+    ssml_value = params.get("SSML")
+    if ssml_value:
+        return str(ssml_value), True
+
+    text_value = str(params.get("Text", "") or "")
+    discriminator = str(params.get("TextType") or params.get("InterpretAs") or "")
+    return text_value, discriminator.strip().lower() == "ssml"
+
+
 def _get_phone_destination(action: FlowAction) -> Optional[str]:
     """Extract the phone number destination from a transfer action."""
     params = action.parameters or {}
@@ -157,17 +188,52 @@ def _get_phone_destination(action: FlowAction) -> Optional[str]:
 
 
 class DynamicPromptInjectionCheck(BaseCheck):
-    """Detect dynamic content in voice prompts without validation (Req 20)."""
+    """
+    Detect caller- or externally-sourced values spoken in voice prompts
+    (Req 20).
+
+    Severity is not uniform, because exploitability is not uniform. Three
+    cases, and conflating them was this check's original defect — it reported
+    all of them as HIGH "prompt injection":
+
+    1. **The prompt is interpreted as SSML.** Polly parses the markup in the
+       substituted value, so ``</speak><speak>...`` smuggled through an
+       attribute changes what the platform says. A genuine injection
+       vulnerability: HIGH.
+    2. **Plain text, spoken to somebody other than the caller** (an agent
+       whisper, a transfer or hold flow). No markup is parsed, but text the
+       caller authored reaches an agent as though Connect authored it, which
+       is a workable social-engineering path: MEDIUM.
+    3. **Plain text, spoken back to the caller who supplied it.** The caller
+       hears their own value. Attacker and audience are the same person, so
+       there is no attack unless an external system supplied the value —
+       worth reporting so it can be traced, not worth paging anyone: LOW.
+
+    Note the check reports what it can prove from flow content. It cannot
+    prove where an attribute's value *originated* — Connect does not record
+    that in the flow — so it excludes references a caller provably cannot
+    influence (Connect system attributes) and asks the reader to trace the
+    rest. That is stated in the finding rather than papered over.
+    """
 
     def __init__(self):
         super().__init__(
             check_id="sec-prompt-inject-001",
-            name="Dynamic Prompt Injection Risk",
+            # Named for the mechanism, not the fashionable phrase. "Prompt
+            # injection" now reads as an LLM attack; this is SSML markup
+            # injection into Amazon Polly and spoken-content spoofing, and
+            # no model is involved. The check ID is unchanged so --diff
+            # against existing baselines keeps working.
+            name="Voice Prompt Injection (SSML Markup and Spoken Content)",
             pillar=Pillar.SECURITY,
+            # Declared severity is the worst case (SSML parsing). Individual
+            # findings downgrade per the ladder in the class docstring.
             severity=Severity.HIGH,
             description=(
-                "Detects contact flows that insert unsanitized dynamic content "
-                "(attributes, Lambda returns) into voice prompts or SSML."
+                "Detects contact flows that speak caller- or external-system-"
+                "sourced values in voice prompts without sanitizing them, and "
+                "rates each by whether Polly parses the value as SSML markup "
+                "and who actually hears it."
             ),
         )
 
@@ -180,6 +246,7 @@ class DynamicPromptInjectionCheck(BaseCheck):
             graph = _parse_flow(flow)
             if not graph:
                 continue
+            other_audience = (flow.type or "").upper() in _OTHER_AUDIENCE_FLOW_TYPES
             for action in graph.actions.values():
                 if action.action_type not in (
                     "MessageParticipant",
@@ -187,7 +254,7 @@ class DynamicPromptInjectionCheck(BaseCheck):
                     "PlayAudio",
                 ):
                     continue
-                text = str(action.parameters.get("Text", ""))
+                text, is_ssml = _prompt_text_and_markup(action)
                 dynamic_refs = _DYNAMIC_REF_PATTERN.findall(text)
                 if not dynamic_refs:
                     continue
@@ -203,27 +270,52 @@ class DynamicPromptInjectionCheck(BaseCheck):
                 if all(_is_system_attribute_reference(ref) for ref in dynamic_refs):
                     system_attr_refs_seen += 1
                     continue
+                if is_ssml:
+                    tier, tier_severity = "ssml_parsed", Severity.HIGH
+                elif other_audience:
+                    tier, tier_severity = "other_audience", Severity.MEDIUM
+                else:
+                    tier, tier_severity = "spoken_to_source", Severity.LOW
                 flagged.append(
                     {
                         "flow": flow.name,
                         "flow_id": flow.id,
+                        "flow_type": flow.type,
                         "action_id": action.action_id,
                         "dynamic_ref": text[:120],
+                        "interpreted_as": "ssml" if is_ssml else "text",
+                        "risk_tier": tier,
+                        "severity": tier_severity.value,
                     }
                 )
 
         if flagged:
-            # Show the reader the actual prompt text of the top offenders
-            # so they can eyeball which attributes are being spoken.
+            ssml_hits = [f for f in flagged if f["risk_tier"] == "ssml_parsed"]
+            other_audience_hits = [f for f in flagged if f["risk_tier"] == "other_audience"]
+            self_audience_hits = [f for f in flagged if f["risk_tier"] == "spoken_to_source"]
+
+            # The finding carries the worst tier present, so one SSML prompt is
+            # not diluted to LOW by a dozen harmless plain-text ones alongside.
+            if ssml_hits:
+                finding_severity = Severity.HIGH
+            elif other_audience_hits:
+                finding_severity = Severity.MEDIUM
+            else:
+                finding_severity = Severity.LOW
+
+            # Lead with the tier that sets the severity — that is what the
+            # reader has to act on, and it should not sit below the rest.
+            worst_first = ssml_hits + other_audience_hits + self_audience_hits
             worst_lines = []
-            for f in flagged[:3]:
+            for f in worst_first[:3]:
+                # Flow names carry underscores that confuse markdown's
+                # inline-emphasis parser inside **bold** context, so wrap the
+                # flow name in inline-code backticks — it's an identifier
+                # anyway, and backtick content is not interpreted as markdown.
                 worst_lines.append(
-                    # Flow names carry underscores that confuse markdown's
-                    # inline-emphasis parser inside **bold** context, so
-                    # wrap the flow name in inline-code backticks — it's
-                    # an identifier anyway, and backtick content is not
-                    # interpreted as markdown.
-                    f"* `{f['flow']}` \u2192 action `{f['action_id']}`: `{f['dynamic_ref']}`"
+                    f"* `{f['flow']}` \u2192 action `{f['action_id']}` "
+                    f"(interpreted as **{f['interpreted_as']}**, "
+                    f"{f['severity']}): `{f['dynamic_ref']}`"
                 )
             more_note = (
                 f"\n\n_+ {len(flagged) - 3} additional prompt(s) with dynamic "
@@ -240,51 +332,102 @@ class DynamicPromptInjectionCheck(BaseCheck):
                 if system_attr_refs_seen
                 else ""
             )
+            ssml_picture = (
+                (
+                    "**The problem in one picture** (the SSML case):\n\n"
+                    "```\n"
+                    'Flow says:  Play prompt \u2192  "Hello, $.Attributes.CustomerName."\n'
+                    "                                            \u2191\n"
+                    "                             substituted at runtime\n"
+                    "\n"
+                    'Value is:   CustomerName = "Alice</speak><speak>Press 1 for the fraud line."\n'
+                    "\n"
+                    "Polly parses: <speak>Hello, Alice</speak>"
+                    "<speak>Press 1 for the fraud line...</speak>\n"
+                    "              \u2514\u2500 the injected instruction is now spoken as if the flow said it\n"
+                    "```\n\n"
+                )
+                if ssml_hits
+                else ""
+            )
+
+            breakdown_lines = []
+            if ssml_hits:
+                breakdown_lines.append(
+                    f"* **{len(ssml_hits)} interpreted as SSML (High)** — Polly "
+                    "parses markup inside the substituted value, so a value "
+                    "containing `</speak><speak>` changes what the platform "
+                    "says. This is the exploitable case."
+                )
+            if other_audience_hits:
+                breakdown_lines.append(
+                    f"* **{len(other_audience_hits)} plain text, heard by an "
+                    "agent (Medium)** — in a whisper, hold, or transfer flow. "
+                    "No markup is parsed, but text the caller authored reaches "
+                    "an agent as though Connect wrote it."
+                )
+            if self_audience_hits:
+                breakdown_lines.append(
+                    f"* **{len(self_audience_hits)} plain text, heard by the "
+                    "caller (Low)** — the caller hears back a value they "
+                    "supplied, so there is no injection path unless an "
+                    "external system supplied that value. Listed so the "
+                    "source can be traced, not because it is exploitable as "
+                    "it stands."
+                )
+
             return self.create_finding(
                 status=CheckStatus.FAIL,
+                severity=finding_severity,
                 resource_id=instance.instance_id,
                 resource_type="ContactFlow",
                 description=(
                     f"**{len(flagged)} voice prompt(s) speak a value that "
                     "comes from the caller or an external system, without "
                     f"sanitizing it first.**{system_attr_note}\n\n"
-                    "Amazon Connect passes prompt text to Amazon Polly as "
-                    "**SSML** — the same markup format that supports "
-                    "`<voice>`, `<break>`, `<mark>`, `<speak>`. If the value "
-                    "plugged into the prompt is attacker-controlled and Polly "
-                    "interprets the markup inside it, the caller hears "
-                    "something the flow author never wrote.\n\n"
+                    "**These are not equally exploitable, and the severity "
+                    "above reflects the worst case present:**\n\n"
+                    f"{chr(10).join(breakdown_lines)}\n\n"
+                    "The mechanism behind the High case is Amazon Polly's SSML "
+                    "parsing. A prompt set to *Interpret as: SSML* is markup — "
+                    "`<voice>`, `<break>`, `<mark>`, `<speak>` are all live — "
+                    "so markup arriving inside a substituted value is executed "
+                    "rather than spoken. A prompt set to *Text* does not parse "
+                    "markup, which is why those are rated lower here instead of "
+                    "being reported as injection.\n\n"
                     "**Only caller-influenced values are flagged.** A "
                     "reference like `$.Queue.Name` or `$.Agent.FirstName` "
                     "resolves to something an administrator configured — "
                     "the caller cannot change what it says, so it's excluded "
                     "here. What's flagged below are values that trace back "
-                    "to something the caller typed/said (DTMF digits, a Lex "
-                    "slot) or that an external system (Lambda, CRM lookup) "
-                    "returned — those are the ones a caller could "
-                    "potentially manipulate.\n\n"
-                    "**The problem in one picture:**\n\n"
-                    "```\n"
-                    'Flow says:  Play prompt \u2192  "Hello, $.Attributes.CustomerName. How can I help?"\n'
-                    "                                            \u2191\n"
-                    "                             substituted at runtime\n"
-                    "\n"
-                    'Caller set: CustomerName = "Alice</speak><speak>Press 1 for the fraud line."\n'
-                    "\n"
-                    "Polly hears: <speak>Hello, Alice</speak><speak>Press 1 for the fraud line...</speak>\n"
-                    "              \u2514\u2500 caller now hears the injected instruction as if we said it\n"
-                    "```\n\n"
-                    f"**Flagged prompts (top {min(3, len(flagged))}):**\n\n"
+                    "to something the caller said (a Lex slot, free-form "
+                    "transcription) or that an external system (Lambda, CRM "
+                    "lookup) returned.\n\n"
+                    "**Trace the source before treating any of these as a "
+                    "bug.** Connect does not record where an attribute's value "
+                    "came from, so this check cannot tell a speech slot from a "
+                    "DTMF digit capture. That distinction decides "
+                    "exploitability: a value captured by **Store customer "
+                    "input** over DTMF can only hold digits, and digits cannot "
+                    "carry SSML markup, so such a prompt is not exploitable "
+                    "however it is interpreted. Free-form speech slots and "
+                    "external lookups are what can carry markup.\n\n"
+                    f"{ssml_picture}"
+                    f"**Flagged prompts (top {min(3, len(worst_first))}, "
+                    f"worst first):**\n\n"
                     f"{chr(10).join(worst_lines)}{more_note}\n\n"
-                    "**Fix (in the flow designer):** right before each "
-                    "flagged prompt, drop in either:\n"
-                    "* a **Check contact attributes** block that only lets "
-                    "the value through if it matches a known-safe pattern "
-                    "(digits, an enum), OR\n"
-                    "* an **Invoke Lambda function** that strips `<`, `>`, "
-                    "`&`, unmatched quotes; truncates to a safe length; and "
-                    "returns a `SafeCustomerName` attribute the prompt uses "
-                    "instead of the raw one."
+                    "**Fix (in the flow designer):**\n"
+                    "1. Open each flagged prompt and check its **Interpret "
+                    "as** setting. If it is SSML and does not need to be, "
+                    "switch it to Text \u2014 that alone closes the "
+                    "markup-parsing path.\n"
+                    "2. If it must stay SSML, sanitize upstream with either a "
+                    "**Check contact attributes** block that only passes "
+                    "values matching a known-safe pattern (digits, an enum), "
+                    "or an **Invoke Lambda function** that strips `<`, `>`, "
+                    "`&` and unmatched quotes, truncates to a safe length, and "
+                    "returns a `SafeCustomerName` attribute the prompt "
+                    "references instead of the raw one."
                 ),
                 evidence={
                     "flagged_prompts": flagged,
@@ -292,39 +435,51 @@ class DynamicPromptInjectionCheck(BaseCheck):
                 },
                 structured_remediation=Remediation(
                     summary=(
-                        "Sanitize dynamic content before it reaches voice "
-                        "prompts — SSML is markup that Polly interprets, "
-                        "and unchecked substitution is an injection vector."
+                        "Switch prompts off SSML where markup isn't needed, "
+                        "and sanitize dynamic content reaching the ones that "
+                        "keep it — SSML is markup Polly interprets, and "
+                        "unchecked substitution into it is an injection vector."
                     ),
                     target_resources=[f["action_id"] for f in flagged],
                     steps=[
                         RemediationStep(
                             order=1,
                             instruction=(
-                                "Identify the source of each flagged dynamic "
-                                "reference: is it caller-controlled (digit "
-                                "capture, Lex slot, phone-number lookup) or "
-                                "authored-and-controlled (agent-set "
-                                "attribute, Connect system attribute)? Only "
-                                "the caller-controlled ones need "
-                                "sanitization."
+                                "Check each flagged prompt's 'Interpret as' "
+                                "setting. Prompts set to Text do not parse "
+                                "markup; prompts set to SSML are the "
+                                "injectable ones. Switch SSML to Text "
+                                "wherever the prompt does not actually use "
+                                "markup — the cheapest fix, and it removes "
+                                "the vector outright rather than filtering it."
                             ),
                         ),
                         RemediationStep(
                             order=2,
                             instruction=(
-                                "For caller-controlled values, insert a "
-                                "Lambda immediately upstream of the prompt "
-                                "that: strips `<`, `>`, `&`; rejects "
-                                "unbalanced quotes; truncates to a safe "
-                                "length (e.g. 60 chars for a name); returns "
-                                "the sanitized string as a new attribute. "
-                                "The prompt then references the sanitized "
-                                "attribute, not the raw one."
+                                "Trace what sets each flagged attribute. A "
+                                "DTMF 'Store customer input' capture holds "
+                                "digits only and cannot carry markup, so "
+                                "those need no sanitization. Free-form speech "
+                                "slots and Lambda/CRM lookups can, and are "
+                                "what the remaining steps address."
                             ),
                         ),
                         RemediationStep(
                             order=3,
+                            instruction=(
+                                "For values that must stay in an SSML prompt, "
+                                "insert a Lambda immediately upstream that: "
+                                "strips `<`, `>`, `&`; rejects unbalanced "
+                                "quotes; truncates to a safe length (e.g. 60 "
+                                "chars for a name); returns the sanitized "
+                                "string as a new attribute. The prompt then "
+                                "references the sanitized attribute, not the "
+                                "raw one."
+                            ),
+                        ),
+                        RemediationStep(
+                            order=4,
                             instruction=(
                                 "For values that should match a fixed set "
                                 "(department names, product codes), use a "
@@ -368,10 +523,10 @@ class DynamicPromptInjectionCheck(BaseCheck):
                 f"external-system-sourced value.{system_attr_note} Every "
                 "prompt either uses a hard-coded string, or its only "
                 "dynamic reference is a Connect system attribute the caller "
-                "cannot influence — neither is a vector for the SSML "
-                "injection this check looks for (malicious `</speak><speak>` "
-                "markup or attacker-authored text smuggled through a value "
-                "the caller controls)."
+                "cannot influence. Neither is a vector for what this check "
+                "looks for: `</speak><speak>` markup smuggled into an "
+                "SSML-interpreted prompt, or attacker-authored text spoken to "
+                "an agent as though the flow wrote it."
             ),
             evidence={
                 "flows_analyzed": len(instance.contact_flows),
@@ -908,113 +1063,6 @@ class PIIInPromptsCheck(BaseCheck):
         )
 
 
-class OutputHandlingInjectionCheck(BaseCheck):
-    """Detect external output piped to actions without sanitization (Req 26)."""
-
-    def __init__(self):
-        super().__init__(
-            check_id="sec-output-handling-001",
-            name="Contact Flow Output Handling / Injection Prevention",
-            pillar=Pillar.SECURITY,
-            severity=Severity.HIGH,
-            description=(
-                "Detects data-flow paths where external outputs (Lambda, Lex) "
-                "reach downstream actions (prompts, transfers, subsequent "
-                "invocations) without intermediate validation."
-            ),
-        )
-
-    def execute(self, context: CheckContext):
-        instance = context.instance
-        flagged = []
-
-        for flow in instance.contact_flows:
-            graph = _parse_flow(flow)
-            if not graph:
-                continue
-
-            # Walk each external-data action and check what follows it.
-            for action in graph.actions.values():
-                if action.action_type not in _EXTERNAL_DATA_ACTIONS:
-                    continue
-                # Look at immediate successors for high-risk consumers.
-                for t in action.transitions:
-                    succ = graph.actions.get(t.target_action_id)
-                    if not succ:
-                        continue
-                    # Prompt right after external data = injection path.
-                    if succ.action_type in ("MessageParticipant", "PlayPrompt"):
-                        text = str(succ.parameters.get("Text", ""))
-                        if "$." in text:
-                            flagged.append(
-                                {
-                                    "flow": flow.name,
-                                    "flow_id": flow.id,
-                                    "source_action": action.action_id,
-                                    "consumer_action": succ.action_id,
-                                    "path": "external -> prompt (no validation)",
-                                }
-                            )
-                    # Transfer after external data = routing manipulation.
-                    if succ.action_type in _PHONE_TRANSFER_TYPES:
-                        dest = _get_phone_destination(succ)
-                        if dest and _is_dynamic_reference(dest):
-                            flagged.append(
-                                {
-                                    "flow": flow.name,
-                                    "flow_id": flow.id,
-                                    "source_action": action.action_id,
-                                    "consumer_action": succ.action_id,
-                                    "path": "external -> transfer (no validation)",
-                                }
-                            )
-
-        if flagged:
-            return self.create_finding(
-                status=CheckStatus.FAIL,
-                resource_id=instance.instance_id,
-                resource_type="ContactFlow",
-                description=(
-                    f"{len(flagged)} output-handling injection path(s) detected "
-                    "where external data flows to prompts or transfers without "
-                    "intermediate validation."
-                ),
-                evidence={"injection_paths": flagged},
-                structured_remediation=Remediation(
-                    summary=(
-                        "Insert validation between external data sources and "
-                        "downstream consumers (prompts, transfers)."
-                    ),
-                    target_resources=[f["source_action"] for f in flagged],
-                    steps=[
-                        RemediationStep(
-                            order=1,
-                            instruction=(
-                                "Add a Check Attribute or Lambda sanitization "
-                                "step between the external data source and the "
-                                "consuming action. Validate that the value "
-                                "matches expected format/allowlist."
-                            ),
-                        ),
-                    ],
-                    references=[
-                        RemediationReference(
-                            title="OWASP LLM05: Improper Output Handling",
-                            url="https://owasp.org/www-project-top-10-for-large-language-model-applications/",  # noqa: E501
-                        )
-                    ],
-                ),
-            )
-
-        return self.create_finding(
-            status=CheckStatus.PASS,
-            resource_id=instance.instance_id,
-            resource_type="ContactFlow",
-            description="No unvalidated external-output injection paths detected.",
-            evidence={"flows_analyzed": len(instance.contact_flows)},
-        )
-
-
 def register_contact_flow_security_checks(registry) -> None:
     """Register all contact-flow security checks."""
     registry.register_check(DynamicPromptInjectionCheck())
@@ -1022,4 +1070,3 @@ def register_contact_flow_security_checks(registry) -> None:
     registry.register_check(ExternalTransferTollFraudCheck())
     registry.register_check(SensitiveDataInAttributesCheck())
     registry.register_check(PIIInPromptsCheck())
-    registry.register_check(OutputHandlingInjectionCheck())

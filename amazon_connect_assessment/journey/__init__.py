@@ -94,7 +94,7 @@ def run_journey_mapping(
     )
 
     # Step 6: Generate findings
-    findings = generate_journey_findings(result)
+    findings = generate_journey_findings(result, instance_id=instance.instance_id)
 
     return JourneyMappingOutput(result=result, findings=findings)
 

@@ -505,15 +505,39 @@ class AWSClientFactory:
         client = self.get_lex_v2_client()
         return self.call_api_with_resilience(client, "describe_bot", "lexv2-models", botId=bot_id)
 
-    def describe_lex_v2_bot_alias_resilient(self, bot_id: str, bot_alias_id: str) -> Dict[str, Any]:
-        """Describe a Lex V2 bot alias with network resilience."""
-        client = self.get_lex_v2_client()
+    def describe_lex_v2_bot_alias_resilient(
+        self, bot_id: str, bot_alias_id: str, region_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Describe a Lex V2 bot alias with network resilience.
+
+        ``region_name`` is honoured because a Connect instance can be
+        associated with a bot that lives in another region; the alias ARN
+        returned by ``connect:ListBots`` carries the region to call.
+        """
+        client = (
+            self.get_client("lexv2-models", region_name=region_name)
+            if region_name
+            else self.get_lex_v2_client()
+        )
         return self.call_api_with_resilience(
             client,
             "describe_bot_alias",
             "lexv2-models",
             botId=bot_id,
             botAliasId=bot_alias_id,
+        )
+
+    def list_bots_resilient(self, instance_id: str, lex_version: str, **kwargs) -> Dict[str, Any]:
+        """List the Lex bots associated with a Connect instance for one Lex version."""
+        client = self.get_connect_client()
+        return self.call_api_with_resilience(
+            client,
+            "list_bots",
+            "connect",
+            InstanceId=instance_id,
+            LexVersion=lex_version,
+            **kwargs,
         )
 
     def list_integration_associations_resilient(
@@ -553,6 +577,17 @@ class AWSClientFactory:
         return self.call_api_with_resilience(
             client,
             "list_ai_guardrails",
+            "qconnect",
+            assistantId=assistant_id,
+            **kwargs,
+        )
+
+    def list_ai_agents_resilient(self, assistant_id: str, **kwargs) -> Dict[str, Any]:
+        """List assistant-scoped Q in Connect AI agents with resilience."""
+        client = self.get_qconnect_client()
+        return self.call_api_with_resilience(
+            client,
+            "list_ai_agents",
             "qconnect",
             assistantId=assistant_id,
             **kwargs,

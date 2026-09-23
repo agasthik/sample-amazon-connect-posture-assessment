@@ -17,10 +17,13 @@ from amazon_connect_assessment.checks.capacity_checks import (
     ConcurrentCallsHeadroomCheck,
     ConfigurationQuotaUtilizationCheck,
     QuotaLookupDenied,
-    _linear_slope,
+    QuotaLookupIncomplete,
+    _linear_fit,
     _match_quota,
+    _MetricWindow,
     _weekly_peaks,
     get_connect_quotas,
+    quota_context_ids,
     register_capacity_checks,
     reset_quota_cache,
 )
@@ -30,6 +33,11 @@ from amazon_connect_assessment.models import CheckStatus, Severity
 ACCESS_DENIED = ClientError(
     {"Error": {"Code": "AccessDeniedException", "Message": "denied"}}, "ListServiceQuotas"
 )
+
+# Two instances in one region, which is the case a region-keyed quota table
+# cannot represent.
+ARN_A = "arn:aws:connect:us-east-1:123456789012:instance/instance-a"
+ARN_B = "arn:aws:connect:us-east-1:123456789012:instance/instance-b"
 
 # Quota names as Service Quotas publishes them for Amazon Connect.
 DEFAULT_QUOTAS = [
@@ -182,6 +190,89 @@ class TestQuotaLookup:
         # Two operations on the first call, nothing on the second.
         assert len(api.calls) == 2
 
+    # --- Instance scoping. A Connect quota can be raised for one instance, so
+    # the region's table is a set of candidate values, not an answer. Reducing
+    # it to one number per region evaluated every instance in the region
+    # against whichever record happened to be read last. ---
+
+    def test_resource_level_quota_applies_only_to_its_instance(self, mock_aws_client_factory):
+        api = _Api(
+            **_quota_responses(
+                applied=[
+                    {
+                        "QuotaName": "Users per instance",
+                        "QuotaCode": "L-CE1D9967",
+                        "Value": 5000.0,
+                        "QuotaAppliedAtLevel": "RESOURCE",
+                        "QuotaContext": {
+                            "ContextScope": "RESOURCE",
+                            "ContextScopeType": "connect:instance",
+                            "ContextId": ARN_B,
+                        },
+                    }
+                ]
+            )
+        )
+        _wire(mock_aws_client_factory, api)
+        # Instance B had its ceiling raised; A is still on the AWS default. One
+        # regional value for both reports A as 9% consumed when it is at 90%,
+        # or B as 200% consumed when it has plenty of room.
+        assert get_connect_quotas(mock_aws_client_factory, (ARN_A,))["Users per instance"] == 500.0
+        assert get_connect_quotas(mock_aws_client_factory, (ARN_B,))["Users per instance"] == 5000.0
+        # And resolving per instance must not cost an extra listing.
+        assert len(api.calls) == 2
+
+    def test_resource_value_outranks_account_value(self, mock_aws_client_factory):
+        api = _Api(
+            **_quota_responses(
+                applied=[
+                    {"QuotaName": "Users per instance", "Value": 1000.0},
+                    {
+                        "QuotaName": "Users per instance",
+                        "Value": 5000.0,
+                        "QuotaContext": {"ContextId": ARN_B},
+                    },
+                ]
+            )
+        )
+        _wire(mock_aws_client_factory, api)
+        quotas = get_connect_quotas(mock_aws_client_factory, (ARN_B,))
+        assert quotas["Users per instance"] == 5000.0
+        # An instance with no resource-level record falls back to the account
+        # value, and only then to the AWS default.
+        assert get_connect_quotas(mock_aws_client_factory, (ARN_A,))["Users per instance"] == 1000.0
+
+    def test_applied_listing_asks_for_resource_level_values(self, mock_aws_client_factory):
+        # Without QuotaAppliedAtLevel the response carries account-level values
+        # only, so a per-instance increase would never be seen and the fix above
+        # would have nothing to resolve against.
+        api = _Api(**_quota_responses())
+        _wire(mock_aws_client_factory, api)
+        get_connect_quotas(mock_aws_client_factory)
+        assert api.kwargs_for("list_service_quotas")["QuotaAppliedAtLevel"] == "ALL"
+
+    def test_instance_id_is_offered_as_a_context_id(self, sample_connect_instance):
+        # Service Quotas does not document whether Connect keys the context on
+        # the ARN or the ID, so both are offered rather than one guessed.
+        ids = quota_context_ids(sample_connect_instance)
+        assert sample_connect_instance.instance_arn in ids
+        assert sample_connect_instance.instance_id in ids
+
+    def test_truncated_listing_raises_rather_than_returning_a_partial_table(
+        self, mock_aws_client_factory
+    ):
+        # A truncated table keeps the defaults read first and drops the applied
+        # values that would have superseded them, so every percentage it feeds
+        # is computed against a ceiling that may not be in force.
+        page = {"Quotas": DEFAULT_QUOTAS, "NextToken": "more"}
+        api = _Api(
+            list_aws_default_service_quotas=[page] * 21,
+            list_service_quotas={"Quotas": []},
+        )
+        _wire(mock_aws_client_factory, api)
+        with pytest.raises(QuotaLookupIncomplete):
+            get_connect_quotas(mock_aws_client_factory)
+
     def test_non_access_denied_error_propagates(self, mock_aws_client_factory):
         # A throttle or network fault must not be silently swallowed into an
         # empty quota table, which would read as "no quotas published".
@@ -215,29 +306,59 @@ def _consecutive(values):
     return [(index, float(value)) for index, value in enumerate(values)]
 
 
+def _slope(points):
+    return _linear_fit(points)[0]
+
+
+def _window(points, lookback_days=90, end=None):
+    """A metric window around ``(timestamp, value)`` pairs, as the check sees one."""
+    end = end or datetime.now(timezone.utc)
+    return _MetricWindow(
+        points=sorted(points, key=lambda item: item[0]),
+        start=end - timedelta(days=lookback_days),
+        end=end,
+        lookback_days=lookback_days,
+    )
+
+
 class TestTrendMath:
     def test_slope_detects_growth(self):
-        assert _linear_slope(_consecutive([10, 20, 30, 40])) == pytest.approx(10.0)
+        assert _slope(_consecutive([10, 20, 30, 40])) == pytest.approx(10.0)
 
     def test_slope_detects_decline(self):
-        assert _linear_slope(_consecutive([40, 30, 20, 10])) == pytest.approx(-10.0)
+        assert _slope(_consecutive([40, 30, 20, 10])) == pytest.approx(-10.0)
 
     def test_single_outlier_does_not_dominate(self):
         # Flat series with one spike at the end: a first-vs-last comparison
         # would call this steep growth, least squares should not.
-        assert _linear_slope(_consecutive([10, 10, 10, 10, 10, 10, 60])) < 8.0
+        assert _slope(_consecutive([10, 10, 10, 10, 10, 10, 60])) < 8.0
 
     def test_slope_uses_elapsed_weeks_not_list_position(self):
         # The same four peaks spread over ten weeks grow at a third of the rate.
         # Regressing against position reported 10/week for both, understating
         # the runway threefold and escalating severity on the strength of it.
         gapped = [(0, 10.0), (3, 20.0), (6, 30.0), (9, 40.0)]
-        assert _linear_slope(gapped) == pytest.approx(10.0 / 3, abs=0.01)
-        assert _linear_slope(_consecutive([10, 20, 30, 40])) == pytest.approx(10.0)
+        assert _slope(gapped) == pytest.approx(10.0 / 3, abs=0.01)
+        assert _slope(_consecutive([10, 20, 30, 40])) == pytest.approx(10.0)
+
+    def test_fit_returns_the_intercept_as_well_as_the_slope(self):
+        # The intercept is what lets a projection start from the fitted level
+        # rather than from the last raw observation.
+        slope, intercept = _linear_fit(_consecutive([30, 40, 50, 60]))
+        assert slope == pytest.approx(10.0)
+        assert intercept == pytest.approx(30.0)
+
+    def test_fitted_level_ignores_a_quiet_final_week(self):
+        # Six weeks climbing 10/week, then a quiet week at 20. Anchoring on the
+        # raw final peak puts the current level at 20 with a 100-call quota
+        # 8 weeks away; the fit puts it near 55, which is where the trend is.
+        points = _consecutive([10, 20, 30, 40, 50, 60]) + [(6, 20.0)]
+        slope, intercept = _linear_fit(points)
+        assert intercept + slope * 6 > 40.0
 
     def test_weekly_peaks_take_the_max_per_bucket(self):
         points = [(_days_ago(20 - day), float(day)) for day in range(21)]
-        weekly = _weekly_peaks(points)
+        weekly = _weekly_peaks(_window(points))
         assert [week for week, _ in weekly] == [0, 1, 2]
         assert [peak for _, peak in weekly] == sorted(peak for _, peak in weekly)
 
@@ -245,7 +366,24 @@ class TestTrendMath:
         # A week with no datapoint is absent, not zero: CloudWatch reporting
         # nothing is not the same claim as the instance having taken no calls.
         points = [(_days_ago(21), 10.0), (_days_ago(7), 30.0)]
-        assert _weekly_peaks(points) == [(0, 10.0), (2, 30.0)]
+        assert _weekly_peaks(_window(points)) == [(0, 10.0), (2, 30.0)]
+
+    def test_buckets_are_anchored_to_the_window_end(self):
+        # The most recent bucket must cover a full seven days. Anchored to the
+        # first datapoint instead, a window that does not divide into whole
+        # weeks leaves the *newest* bucket short, so it reports the peak of a
+        # few days against buckets reporting the peak of seven.
+        newest = [(_days_ago(day), 50.0) for day in range(7)]
+        oldest = [(_days_ago(day), 10.0) for day in range(7, 14)]
+        weekly = _weekly_peaks(_window(newest + oldest, lookback_days=90))
+        assert weekly == [(0, 10.0), (1, 50.0)]
+
+    def test_short_leading_bucket_is_dropped(self):
+        # A 90-day lookback holds 12 whole weeks and a 6-day remainder. A
+        # datapoint in that remainder would form a bucket covering less than a
+        # week, understating its peak and tilting the fit.
+        points = [(_days_ago(88), 99.0), (_days_ago(3), 10.0)]
+        assert _weekly_peaks(_window(points, lookback_days=90)) == [(0, 10.0)]
 
 
 # ---------------------------------------------------------------------------
@@ -388,9 +526,97 @@ class TestConfigurationQuotaUtilization:
         finding = self._run(check_context, api)
         assert "users" in finding.evidence["unmeasured_resources"]
         assert "users" not in finding.evidence["measured"]
+        assert finding.evidence["unmeasured_reasons"]["users"] == "access_denied"
         # A denied user read must not discard the subjects still measurable.
         assert "queues" in finding.evidence["measured"]
         assert "phone_numbers" in finding.evidence["measured"]
+
+    # --- a bounded page pull that ran out of pages is a lower bound, and a
+    # lower bound over a quota is a utilization figure that can only be too
+    # low — the direction that turns a breach into a PASS. ---
+
+    def test_exhausted_page_limit_is_unmeasured_not_a_total(self, check_context):
+        _populate(check_context.instance)
+        # Every one of the 20 permitted pages is full and still carries a token:
+        # 2,000 users counted, an unknown number unread. Reported as 2,000 of a
+        # 4,000 quota this is 50% and a PASS; the instance could be at 88%.
+        api = _Api(
+            **_quota_responses(),
+            list_users=[_users(100, next_token="more")] * 21,
+            list_phone_numbers_v2={"ListPhoneNumbersSummaryList": []},
+        )
+        finding = self._run(check_context, api)
+        assert "users" not in finding.evidence["measured"]
+        assert "users" in finding.evidence["unmeasured_resources"]
+        assert finding.evidence["unmeasured_reasons"]["users"].startswith("count_incomplete")
+        assert "connect:ListUsers" in finding.evidence["unmeasured_reasons"]["users"]
+        # The subjects that were fully read are still assessed.
+        assert "queues" in finding.evidence["measured"]
+
+    def test_final_page_without_a_token_is_a_complete_count(self, check_context):
+        _populate(check_context.instance)
+        # The bound itself is fine. Exactly 20 pages where the last one carries
+        # no token is a finished collection, not a truncated one.
+        api = _Api(
+            **_quota_responses(defaults=[{"QuotaName": "Users per instance", "Value": 4000.0}]),
+            list_users=[_users(100, next_token=f"p{i}") for i in range(19)] + [_users(100)],
+            list_phone_numbers_v2={"ListPhoneNumbersSummaryList": []},
+        )
+        finding = self._run(check_context, api)
+        assert finding.evidence["measured"]["users"]["count"] == 2000
+        assert "users" not in finding.evidence["unmeasured_resources"]
+
+    def test_truncated_phone_number_count_is_unmeasured(self, check_context):
+        _populate(check_context.instance)
+        api = _Api(
+            **_quota_responses(),
+            list_users=_users(10),
+            list_phone_numbers_v2=[{"ListPhoneNumbersSummaryList": [{}] * 100, "NextToken": "more"}]
+            * 21,
+        )
+        finding = self._run(check_context, api)
+        assert "phone_numbers" not in finding.evidence["measured"]
+        assert finding.evidence["unmeasured_reasons"]["phone_numbers"].startswith(
+            "count_incomplete"
+        )
+
+    # --- instance scoping, end to end ---------------------------------------
+
+    def test_two_instances_in_one_region_use_their_own_quotas(
+        self, make_check_context, sample_connect_instance
+    ):
+        import copy
+
+        raised = copy.deepcopy(sample_connect_instance)
+        raised.instance_id, raised.instance_arn = "instance-b", ARN_B
+        default = copy.deepcopy(sample_connect_instance)
+        default.instance_id, default.instance_arn = "instance-a", ARN_A
+
+        applied = [
+            {
+                "QuotaName": "Users per instance",
+                "Value": 5000.0,
+                "QuotaContext": {"ContextId": ARN_B},
+            }
+        ]
+        findings = {}
+        for instance in (raised, default):
+            _populate(instance)
+            context = make_check_context(instance=instance)
+            api = _Api(
+                **_quota_responses(applied=applied),
+                list_users=_users(50),
+                list_phone_numbers_v2={"ListPhoneNumbersSummaryList": []},
+            )
+            findings[instance.instance_id] = self._run(context, api)
+
+        # 50 users against 5,000 on the instance whose ceiling was raised, and
+        # against the 500 default on the one that was not. A single regional
+        # value reported both at whichever figure was read last.
+        assert findings["instance-b"].evidence["measured"]["users"]["quota_value"] == 5000.0
+        assert findings["instance-a"].evidence["measured"]["users"]["quota_value"] == 500.0
+        assert findings["instance-b"].evidence["measured"]["users"]["utilization_pct"] == 1.0
+        assert findings["instance-a"].evidence["measured"]["users"]["utilization_pct"] == 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +786,62 @@ class TestCallVolumeGrowthTrend:
             {"week_index": 9, "peak": 40.0},
         ]
         assert finding.evidence["projected_weeks_to_quota"] == pytest.approx(18.0, abs=0.5)
+
+    def test_stale_history_is_not_projected_as_a_current_forecast(self, check_context):
+        # Four rising peaks that stop eight weeks ago, then silence. The trend is
+        # real but it is not running: projecting "the quota is reached in about
+        # six weeks" from a two-month-old peak names a deadline in the past.
+        api = _Api(
+            **_quota_responses(),
+            get_metric_statistics=_metric_response(
+                [
+                    (_days_ago(77), 63.0),
+                    (_days_ago(70), 70.0),
+                    (_days_ago(63), 77.0),
+                    (_days_ago(56), 84.0),
+                ]
+            ),
+        )
+        finding = self._run(check_context, api)
+        assert finding.status is CheckStatus.NOT_APPLICABLE
+        assert finding.evidence["latest_datapoint_age_days"] == 56
+        assert len(finding.evidence["weekly_peaks"]) == 4
+        assert finding.evidence["staleness_tolerance_days"] == 14
+        assert "projected_weeks_to_quota" not in finding.evidence
+
+    def test_one_missing_week_is_still_a_current_forecast(self, check_context):
+        # The tolerance is two buckets, because CloudWatch routinely returns no
+        # datapoint for a single quiet week. That must not suppress the check.
+        api = _Api(
+            **_quota_responses(),
+            get_metric_statistics=_metric_response(
+                [
+                    (_days_ago(28), 30.0),
+                    (_days_ago(21), 40.0),
+                    (_days_ago(14), 50.0),
+                    (_days_ago(7), 60.0),
+                ]
+            ),
+        )
+        finding = self._run(check_context, api)
+        assert finding.status is CheckStatus.FAIL
+        assert finding.evidence["latest_datapoint_age_days"] == 7
+
+    def test_a_quiet_final_week_does_not_extend_the_runway(self, check_context):
+        # Five weeks climbing 10/week to 70, then a final week that drops to 20
+        # — a holiday, an outage, a partial bucket. Anchoring the projection on
+        # that raw 20 reports 80 calls of headroom against the 100-call quota
+        # and moves the instance out of the horizon; the fitted level at the
+        # latest week keeps it in.
+        api = _Api(
+            **_quota_responses(),
+            get_metric_statistics=self._weekly([30, 40, 50, 60, 70, 20]),
+        )
+        finding = self._run(check_context, api)
+        assert finding.evidence["latest_weekly_peak"] == 20.0
+        # The fit still slopes up, so the baseline sits well above the dip.
+        assert finding.evidence["trend_value_at_latest_week"] > 20.0
+        assert finding.evidence["growth_calls_per_week"] > 0
 
 
 class TestRegistration:

@@ -24,7 +24,7 @@ remediation.
 """
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -77,6 +77,13 @@ _GROWTH_LOOKBACK_DAYS = 90
 _GROWTH_HORIZON_WEEKS = 26
 _MIN_GROWTH_DATA_POINTS = 4
 
+# A trend is only a forecast if it is still running. Past this age the most
+# recent weekly peak is history, and projecting "you reach the quota in six
+# weeks" from a two-month-old observation states a deadline that has already
+# passed. Two weekly buckets is the tolerance: one lets a single missing week
+# through, which CloudWatch produces routinely.
+_MAX_TREND_STALENESS_DAYS = 14
+
 _QUOTA_DOC_URL = (
     "https://docs.aws.amazon.com/connect/latest/adminguide/amazon-connect-service-limits.html"
 )
@@ -85,8 +92,42 @@ _QUOTA_INCREASE_URL = (
 )
 
 
-class QuotaLookupDenied(Exception):
+class QuotaLookupUnavailable(Exception):
+    """Base class for a quota table that could not be read completely."""
+
+
+class QuotaLookupDenied(QuotaLookupUnavailable):
     """Raised when every Service Quotas read is denied, so checks can SKIP."""
+
+
+class QuotaLookupIncomplete(QuotaLookupUnavailable):
+    """
+    Raised when a quota listing was truncated by the page bound.
+
+    Kept distinct from ``QuotaLookupDenied`` because the remedy is different: a
+    denial names a missing permission, while truncation means the table on hand
+    may be missing the applied value for a quota whose default was read — which
+    would be reported as a percentage of the wrong ceiling.
+    """
+
+
+class _IncompleteCountError(Exception):
+    """
+    Raised when a bounded page pull ended with pages still outstanding.
+
+    The count collected so far is a lower bound, not a total, so the caller must
+    treat the subject as unmeasured. Returning the partial figure would under-
+    report utilization by however much was left unread — the direction that
+    turns a breach into a PASS.
+    """
+
+    def __init__(self, operation: str, pages: int, counted: int) -> None:
+        super().__init__(
+            f"{operation} still had pages after {pages} requests; "
+            f"{counted} record(s) counted is a lower bound, not a total"
+        )
+        self.operation = operation
+        self.counted = counted
 
 
 @dataclass(frozen=True)
@@ -114,90 +155,230 @@ _CONFIG_SUBJECTS: Tuple[_QuotaSubject, ...] = (
 _CONCURRENT_CALLS_KEYWORDS: Tuple[str, ...] = ("concurrent", "calls", "per instance")
 
 
+@dataclass(frozen=True)
+class _QuotaRecord:
+    """One Connect quota and every applied value that could bound it."""
+
+    name: str
+    code: str
+    default_value: Optional[float] = None
+    account_value: Optional[float] = None
+    # (context id, value) rather than a dict so the record stays hashable and
+    # the cached table cannot be mutated by a caller resolving against it.
+    resource_values: Tuple[Tuple[str, float], ...] = ()
+
+    def value_for(self, context_ids: Tuple[str, ...]) -> Optional[float]:
+        """
+        Resolve the ceiling that applies to one instance.
+
+        Precedence is the resource-level applied value for this instance, then
+        the account-level applied value, then the AWS default. The distinction
+        matters because a resource-level increase is granted to one instance:
+        two instances in the same region can sit under different ceilings, and
+        collapsing them to a single regional number reports the smaller one as
+        having headroom it does not have, and the larger one as breaching a
+        limit that does not apply to it.
+        """
+        for context_id in context_ids:
+            for known_id, value in self.resource_values:
+                if known_id == context_id:
+                    return value
+        if self.account_value is not None:
+            return self.account_value
+        return self.default_value
+
+
 # ---------------------------------------------------------------------------
 # Quota lookup, cached per region
 #
 # Every check in this module needs the same quota table, and the checks run in
 # parallel, so the table is fetched once and shared. Without the cache a
 # three-check run makes the same paginated Service Quotas calls three times.
+#
+# The table is keyed by region and resolved per instance, rather than cached
+# already-resolved: the listing is regional, but the value that applies is not.
 # ---------------------------------------------------------------------------
-_QUOTA_CACHE: Dict[str, Dict[str, float]] = {}
-_QUOTA_CACHE_LOCK = threading.Lock()
+_QUOTA_CACHE: Dict[str, Dict[str, _QuotaRecord]] = {}
+# One lock per region rather than one lock for the cache, so a fetch for one
+# region does not park the checks assessing another behind unrelated network
+# I/O. ``_QUOTA_LOCK_GUARD`` only covers handing out the per-region lock.
+_QUOTA_LOCKS: Dict[str, threading.Lock] = {}
+_QUOTA_LOCK_GUARD = threading.Lock()
 
 
-def _list_quotas(factory: Any, operation: str) -> Dict[str, float]:
-    """Paginate one Service Quotas list operation into ``{quota name: value}``."""
+def _quota_lock(region: str) -> threading.Lock:
+    """Return the lock guarding one region's entry in the quota cache."""
+    with _QUOTA_LOCK_GUARD:
+        return _QUOTA_LOCKS.setdefault(region, threading.Lock())
+
+
+def _list_quotas(factory: Any, operation: str, **extra: Any) -> List[Dict[str, Any]]:
+    """
+    Paginate one Service Quotas list operation into its raw quota records.
+
+    Raises:
+        QuotaLookupIncomplete: if pages remain after the bound. A truncated
+            table silently drops applied values while keeping the defaults that
+            were read first, so the alternative is a utilization percentage
+            computed against a ceiling that is not in force.
+    """
     client = factory.get_client("service-quotas")
-    quotas: Dict[str, float] = {}
+    records: List[Dict[str, Any]] = []
     next_token: Optional[str] = None
 
     for _ in range(_QUOTA_PAGE_LIMIT):
         kwargs: Dict[str, Any] = {
             "ServiceCode": _QUOTA_SERVICE_CODE,
             "MaxResults": _QUOTA_PAGE_SIZE,
+            **extra,
         }
         if next_token:
             kwargs["NextToken"] = next_token
 
         response = factory.call_api_with_resilience(client, operation, "service-quotas", **kwargs)
-        for quota in response.get("Quotas") or []:
-            name = quota.get("QuotaName")
-            value = quota.get("Value")
-            if name and isinstance(value, (int, float)):
-                quotas[name] = float(value)
+        records.extend(response.get("Quotas") or [])
 
         next_token = response.get("NextToken")
         if not next_token:
             break
 
-    return quotas
+    if next_token:
+        raise QuotaLookupIncomplete(
+            f"{operation} still had pages after {_QUOTA_PAGE_LIMIT} requests, so the "
+            "quota table may be missing an applied value"
+        )
+    return records
 
 
-def get_connect_quotas(factory: Any) -> Dict[str, float]:
+def _context_id(quota: Dict[str, Any]) -> Optional[str]:
+    """Return the resource a quota record applies to, or None if account-wide."""
+    context = quota.get("QuotaContext") or {}
+    context_id = context.get("ContextId")
+    return str(context_id) if context_id else None
+
+
+def _build_quota_table(factory: Any) -> Dict[str, _QuotaRecord]:
     """
-    Return every Connect quota for the assessed region as ``{name: value}``.
+    Read the region's Connect quotas into ``{quota name: record}``.
 
-    Applied quotas are overlaid on AWS defaults. Both calls are made because
-    an applied quota only exists once a customer has requested an increase —
-    reading applied quotas alone returns an empty table for an instance still
-    on defaults, which is exactly the population most likely to be near a
-    ceiling.
+    Both listings are made because an applied quota only exists once a customer
+    has requested an increase — reading applied quotas alone returns an empty
+    table for an instance still on defaults, which is exactly the population
+    most likely to be near a ceiling. The applied listing asks for
+    ``QuotaAppliedAtLevel="ALL"`` so that increases granted to a single instance
+    come back with the ``QuotaContext`` identifying it; without that parameter
+    the response carries account-level values only.
 
     Raises:
         QuotaLookupDenied: if both reads are denied, so the caller can emit a
             SKIPPED finding naming the missing permission rather than a
             misleading PASS.
     """
+    defaults: List[Dict[str, Any]] = []
+    applied: List[Dict[str, Any]] = []
+    denied = 0
+
+    for operation, sink, extra in (
+        ("list_aws_default_service_quotas", defaults, {}),
+        ("list_service_quotas", applied, {"QuotaAppliedAtLevel": "ALL"}),
+    ):
+        try:
+            sink.extend(_list_quotas(factory, operation, **extra))
+        except QuotaLookupIncomplete:
+            raise
+        except Exception as exc:
+            if factory.is_access_denied(exc):
+                denied += 1
+                continue
+            raise
+
+    if denied == 2:
+        raise QuotaLookupDenied("Service Quotas reads denied")
+
+    # Indexed by name, which is what the keyword matcher works on, while the
+    # code is carried through so a record can be tied back to the quota AWS
+    # published it under.
+    table: Dict[str, _QuotaRecord] = {}
+    for quota in defaults:
+        name, value = quota.get("QuotaName"), quota.get("Value")
+        if name and isinstance(value, (int, float)):
+            table[str(name)] = _QuotaRecord(
+                name=str(name),
+                code=str(quota.get("QuotaCode") or ""),
+                default_value=float(value),
+            )
+
+    for quota in applied:
+        name, value = quota.get("QuotaName"), quota.get("Value")
+        if not name or not isinstance(value, (int, float)):
+            continue
+        name = str(name)
+        record = table.get(name) or _QuotaRecord(name=name, code=str(quota.get("QuotaCode") or ""))
+        context_id = _context_id(quota)
+        if context_id:
+            table[name] = replace(
+                record, resource_values=record.resource_values + ((context_id, float(value)),)
+            )
+        else:
+            table[name] = replace(record, account_value=float(value))
+
+    return table
+
+
+def get_connect_quotas(factory: Any, context_ids: Tuple[str, ...] = ()) -> Dict[str, float]:
+    """
+    Return the Connect quotas in force for one instance as ``{name: value}``.
+
+    ``context_ids`` are the identifiers an instance-scoped applied quota can be
+    keyed to — the instance ARN and ID. Passing none yields the account-level
+    view, which is the right answer for a caller that is not assessing a
+    specific instance.
+
+    Raises:
+        QuotaLookupDenied: both Service Quotas reads were denied.
+        QuotaLookupIncomplete: a listing was truncated by the page bound.
+    """
     region = getattr(factory, "region", "default")
-    if region in _QUOTA_CACHE:
-        return _QUOTA_CACHE[region]
+    table = _QUOTA_CACHE.get(region)
+    if table is None:
+        with _quota_lock(region):
+            table = _QUOTA_CACHE.get(region)
+            if table is None:
+                table = _build_quota_table(factory)
+                _QUOTA_CACHE[region] = table
 
-    with _QUOTA_CACHE_LOCK:
-        if region in _QUOTA_CACHE:
-            return _QUOTA_CACHE[region]
+    resolved: Dict[str, float] = {}
+    for name, record in table.items():
+        value = record.value_for(context_ids)
+        if value is not None:
+            resolved[name] = value
+    return resolved
 
-        merged: Dict[str, float] = {}
-        denied = 0
-        for operation in ("list_aws_default_service_quotas", "list_service_quotas"):
-            try:
-                merged.update(_list_quotas(factory, operation))
-            except Exception as exc:
-                if factory.is_access_denied(exc):
-                    denied += 1
-                    continue
-                raise
 
-        if denied == 2:
-            raise QuotaLookupDenied("Service Quotas reads denied")
+def quota_context_ids(instance: Any) -> Tuple[str, ...]:
+    """
+    Identifiers a per-instance applied quota can be keyed to.
 
-        _QUOTA_CACHE[region] = merged
-        return merged
+    Both the ARN and the ID are offered because Service Quotas does not
+    document which form Connect uses as the ``ContextId``, and checking a value
+    that is never present costs nothing while guessing wrong would silently
+    fall back to the account-level ceiling.
+    """
+    return tuple(
+        str(value)
+        for value in (
+            getattr(instance, "instance_arn", None),
+            getattr(instance, "instance_id", None),
+        )
+        if value
+    )
 
 
 def reset_quota_cache() -> None:
     """Clear the per-region quota cache. Exposed for tests."""
-    with _QUOTA_CACHE_LOCK:
+    with _QUOTA_LOCK_GUARD:
         _QUOTA_CACHE.clear()
+        _QUOTA_LOCKS.clear()
 
 
 def _match_quota(
@@ -232,6 +413,24 @@ def _severity_for(worst_pct: float) -> Severity:
     return Severity.HIGH if worst_pct >= _UTILIZATION_CRITICAL_PCT else Severity.MEDIUM
 
 
+def _skipped_for_truncated_quotas(
+    check: BaseCheck, context: CheckContext, error: QuotaLookupIncomplete
+):
+    """Skip a check whose quota table was cut short by the page bound."""
+    return check.create_finding(
+        status=CheckStatus.SKIPPED,
+        resource_id=context.instance.instance_id,
+        resource_type="ConnectInstance",
+        description=(
+            "Skipped: the Service Quotas listing for Amazon Connect was truncated, so "
+            "the ceiling in force for this instance could not be established. Reported "
+            "as Skipped rather than measured against a default that an applied quota "
+            "may already have superseded."
+        ),
+        evidence={"quota_lookup_error": str(error)},
+    )
+
+
 def _quota_references() -> List[RemediationReference]:
     """Shared documentation links for every check in this module."""
     return [
@@ -246,16 +445,40 @@ def _quota_references() -> List[RemediationReference]:
     ]
 
 
-def _daily_peaks(
-    factory: Any, instance_id: str, lookback_days: int
-) -> List[Tuple[datetime, float]]:
+@dataclass(frozen=True)
+class _MetricWindow:
+    """Daily peaks plus the window they were requested over."""
+
+    points: List[Tuple[datetime, float]]
+    start: datetime
+    end: datetime
+    lookback_days: int
+
+    @property
+    def latest_timestamp(self) -> Optional[datetime]:
+        """Timestamp of the most recent datapoint, or None when there are none."""
+        return self.points[-1][0] if self.points else None
+
+    @property
+    def latest_age_days(self) -> Optional[int]:
+        """How stale the most recent datapoint is, measured from the window end."""
+        latest = self.latest_timestamp
+        if latest is None:
+            return None
+        return max(0, (self.end - latest).days)
+
+
+def _daily_peaks(factory: Any, instance_id: str, lookback_days: int) -> _MetricWindow:
     """
-    Return ``(timestamp, daily peak concurrent calls)`` ordered oldest first.
+    Return the daily peak concurrent calls over a window, oldest first.
 
     Sampled at a one-day period and aggregated locally rather than asking
     CloudWatch for weekly buckets, because GetMetricStatistics caps the period
-    at one day. Raises on error so callers can distinguish AccessDenied from
-    "this instance took no calls".
+    at one day. The window bounds are returned with the points because a trend
+    means different things depending on where in the window the data sits — the
+    same four rising peaks are a forecast if they end today and history if they
+    end two months ago. Raises on error so callers can distinguish AccessDenied
+    from "this instance took no calls".
     """
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=lookback_days)
@@ -282,32 +505,56 @@ def _daily_peaks(
         if point.get("Timestamp") is not None and point.get("Maximum") is not None
     ]
     points.sort(key=lambda item: item[0])
-    return points
+    return _MetricWindow(points=points, start=start, end=end, lookback_days=lookback_days)
 
 
-def _weekly_peaks(points: List[Tuple[datetime, float]]) -> List[Tuple[int, float]]:
+def _weekly_peaks(window: _MetricWindow) -> List[Tuple[int, float]]:
     """
     Collapse daily peaks into ``(week index, peak)`` pairs, oldest first.
 
-    The week index is carried rather than discarded because the buckets are not
+    Two properties are load-bearing here.
+
+    The week index is carried rather than discarded, because the buckets are not
     necessarily consecutive — CloudWatch returns no datapoint for a week the
     instance took no calls, so a 90-day window can contain gaps. Regressing
     against list position instead of elapsed weeks would compress each gap into
     a single step and overstate the growth rate by the size of the gap.
+
+    Buckets are measured backwards from the end of the window, not forwards from
+    the first datapoint, so the most recent bucket always covers a full seven
+    days. A lookback that is not a whole number of weeks leaves a short remainder
+    at the *old* end, which is dropped: a bucket covering three days reports the
+    peak of three days against buckets reporting the peak of seven, which
+    under-states it and tilts the fit. Dropping the short bucket costs the oldest
+    few days of history; keeping it biases every projection built on the series.
     """
-    if not points:
+    if not window.points:
         return []
-    origin = points[0][0]
+
+    whole_weeks = window.lookback_days // 7
     buckets: Dict[int, float] = {}
-    for timestamp, value in points:
-        week = (timestamp - origin).days // 7
-        buckets[week] = max(buckets.get(week, value), value)
-    return [(week, buckets[week]) for week in sorted(buckets)]
+    for timestamp, value in window.points:
+        # Clamped because a datapoint can carry a timestamp fractionally after
+        # the window end, which would otherwise floor to a negative bucket.
+        age_days = max(0, (window.end - timestamp).days)
+        bucket_from_end = age_days // 7
+        if whole_weeks and bucket_from_end >= whole_weeks:
+            continue
+        buckets[bucket_from_end] = max(buckets.get(bucket_from_end, value), value)
+
+    if not buckets:
+        return []
+
+    # Re-expressed oldest-first and zero-based so the index reads as elapsed
+    # weeks across the observed series while the spacing between buckets — the
+    # part the regression depends on — is preserved exactly.
+    oldest = max(buckets)
+    return [(oldest - bucket, buckets[bucket]) for bucket in sorted(buckets, reverse=True)]
 
 
-def _linear_slope(points: List[Tuple[int, float]]) -> float:
+def _linear_fit(points: List[Tuple[int, float]]) -> Tuple[float, float]:
     """
-    Least-squares slope of weekly peak against elapsed week index.
+    Least-squares ``(slope, intercept)`` of weekly peak against elapsed week.
 
     Used instead of comparing first and last points so a single anomalous week
     (an outage, a marketing spike) cannot by itself manufacture or erase a
@@ -315,17 +562,24 @@ def _linear_slope(points: List[Tuple[int, float]]) -> float:
     present as zero: CloudWatch reporting nothing is not the same claim as the
     instance having taken no calls, and zero-filling would drag the fitted slope
     toward whichever side of the window the gap falls on.
+
+    The intercept is returned as well as the slope because a projection needs
+    both. Anchoring a forecast on the raw final observation while taking the
+    rate from the fit discards exactly the anomaly resistance the fit was chosen
+    for: a quiet final week then understates the starting point and overstates
+    the runway, and a spiky one does the reverse.
     """
     n = len(points)
     if n == 0:
-        return 0.0
+        return 0.0, 0.0
     mean_x = sum(week for week, _ in points) / n
     mean_y = sum(value for _, value in points) / n
     numerator = sum((week - mean_x) * (value - mean_y) for week, value in points)
     denominator = sum((week - mean_x) ** 2 for week, _ in points)
     if denominator == 0:
-        return 0.0
-    return numerator / denominator
+        return 0.0, mean_y
+    slope = numerator / denominator
+    return slope, mean_y - slope * mean_x
 
 
 def _list_phone_number_count(factory: Any, target_arn: str) -> int:
@@ -335,6 +589,11 @@ def _list_phone_number_count(factory: Any, target_arn: str) -> int:
     Paginated locally, following the same convention as the engine and the
     advanced resilience checks: each call site bounds its own page pull rather
     than depending on a shared helper.
+
+    Raises:
+        _IncompleteCountError: if pages remain after the bound, so the caller
+            records the subject as unmeasured instead of treating a lower bound
+            as a total.
     """
     total = 0
     next_token: Optional[str] = None
@@ -355,6 +614,8 @@ def _list_phone_number_count(factory: Any, target_arn: str) -> int:
         next_token = response.get("NextToken")
         if not next_token:
             break
+    if next_token:
+        raise _IncompleteCountError("connect:ListPhoneNumbersV2", _PHONE_NUMBER_PAGE_LIMIT, total)
     return total
 
 
@@ -367,6 +628,12 @@ def _list_user_count(factory: Any, instance_id: str) -> int:
     collection is empty on every ordinary run, so deriving the count from it
     reported the users quota as unmeasured for every customer. ``connect:
     ListUsers`` is already part of the granted read set.
+
+    Raises:
+        _IncompleteCountError: if pages remain after the bound. This is the
+            realistic case of the two — the bound admits 2,000 users, which an
+            enterprise instance exceeds — and reporting 2,000 of 3,500 against a
+            4,000 quota turns 88% utilization into 50% and a warning into a PASS.
     """
     total = 0
     next_token: Optional[str] = None
@@ -387,6 +654,8 @@ def _list_user_count(factory: Any, instance_id: str) -> int:
         next_token = response.get("NextToken")
         if not next_token:
             break
+    if next_token:
+        raise _IncompleteCountError("connect:ListUsers", _USER_PAGE_LIMIT, total)
     return total
 
 
@@ -407,9 +676,9 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
             ),
         )
 
-    def _measured_counts(self, context: CheckContext) -> Tuple[Dict[str, int], List[str]]:
+    def _measured_counts(self, context: CheckContext) -> Tuple[Dict[str, int], Dict[str, str]]:
         """
-        Return countable resources plus the keys that could not be measured.
+        Return countable resources plus why each unmeasurable one was dropped.
 
         An empty collection is treated as unmeasured rather than as a count of
         zero. Every live Connect instance has at least one user, queue, routing
@@ -418,7 +687,10 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
         false PASS on precisely the instance whose data is missing.
 
         Users and phone numbers are counted directly from their list APIs, both
-        of which this check owns because no analyzer collects them.
+        of which this check owns because no analyzer collects them. A count that
+        hit the page bound with pages outstanding is unmeasured too: it is a
+        lower bound, and a lower bound divided by a quota is a utilization
+        figure that can only ever be too low.
         """
         instance = context.instance
         factory = context.aws_client_factory
@@ -429,7 +701,7 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
             "flows": len(instance.contact_flows),
         }
         counts = {key: value for key, value in candidates.items() if value > 0}
-        unmeasured = [key for key, value in candidates.items() if value == 0]
+        unmeasured = {key: "collection_empty" for key, value in candidates.items() if value == 0}
 
         # Each API-backed subject is counted in its own try block so a denial on
         # one does not discard the other, or the four subjects already measured
@@ -442,10 +714,15 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
         ):
             try:
                 counts[key] = counter()
+            except _IncompleteCountError as exc:
+                # A lower bound is not a count. Recorded as unmeasured with its
+                # own reason so the reader can tell "we were not allowed to look"
+                # from "there was more than we agreed to read".
+                unmeasured[key] = f"count_incomplete: {exc}"
             except Exception as exc:
                 if not factory.is_access_denied(exc):
                     raise
-                unmeasured.append(key)
+                unmeasured[key] = "access_denied"
 
         return counts, unmeasured
 
@@ -454,9 +731,11 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
         factory = context.aws_client_factory
 
         try:
-            quotas = get_connect_quotas(factory)
+            quotas = get_connect_quotas(factory, quota_context_ids(instance))
         except QuotaLookupDenied:
             return self.skipped_for_access_denied(context, "servicequotas:ListServiceQuotas")
+        except QuotaLookupIncomplete as error:
+            return _skipped_for_truncated_quotas(self, context, error)
 
         counts, unmeasured = self._measured_counts(context)
 
@@ -490,6 +769,7 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
             "warn_threshold_pct": _UTILIZATION_WARN_PCT,
             "measured": measured,
             "unmeasured_resources": sorted(unmeasured),
+            "unmeasured_reasons": dict(sorted(unmeasured.items())),
             "quotas_without_published_limit": sorted(unmatched),
         }
 
@@ -611,9 +891,11 @@ class ConcurrentCallsHeadroomCheck(BaseCheck):
         factory = context.aws_client_factory
 
         try:
-            quotas = get_connect_quotas(factory)
+            quotas = get_connect_quotas(factory, quota_context_ids(instance))
         except QuotaLookupDenied:
             return self.skipped_for_access_denied(context, "servicequotas:ListServiceQuotas")
+        except QuotaLookupIncomplete as error:
+            return _skipped_for_truncated_quotas(self, context, error)
 
         match = _match_quota(quotas, _CONCURRENT_CALLS_KEYWORDS)
         if match is None:
@@ -627,12 +909,13 @@ class ConcurrentCallsHeadroomCheck(BaseCheck):
         quota_name, quota_value = match
 
         try:
-            points = _daily_peaks(factory, instance.instance_id, _HEADROOM_LOOKBACK_DAYS)
+            window = _daily_peaks(factory, instance.instance_id, _HEADROOM_LOOKBACK_DAYS)
         except Exception as exc:
             if factory.is_access_denied(exc):
                 return self.skipped_for_access_denied(context, "cloudwatch:GetMetricStatistics")
             raise
 
+        points = window.points
         if not points:
             return self.not_applicable(
                 context,
@@ -756,9 +1039,11 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
         factory = context.aws_client_factory
 
         try:
-            quotas = get_connect_quotas(factory)
+            quotas = get_connect_quotas(factory, quota_context_ids(instance))
         except QuotaLookupDenied:
             return self.skipped_for_access_denied(context, "servicequotas:ListServiceQuotas")
+        except QuotaLookupIncomplete as error:
+            return _skipped_for_truncated_quotas(self, context, error)
 
         match = _match_quota(quotas, _CONCURRENT_CALLS_KEYWORDS)
         if match is None:
@@ -773,13 +1058,13 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
         quota_name, quota_value = match
 
         try:
-            points = _daily_peaks(factory, instance.instance_id, _GROWTH_LOOKBACK_DAYS)
+            window = _daily_peaks(factory, instance.instance_id, _GROWTH_LOOKBACK_DAYS)
         except Exception as exc:
             if factory.is_access_denied(exc):
                 return self.skipped_for_access_denied(context, "cloudwatch:GetMetricStatistics")
             raise
 
-        weekly = _weekly_peaks(points)
+        weekly = _weekly_peaks(window)
         weekly_evidence = [{"week_index": week, "peak": peak} for week, peak in weekly]
         if len(weekly) < _MIN_GROWTH_DATA_POINTS:
             return self.not_applicable(
@@ -792,11 +1077,40 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
                 evidence={"weekly_peaks": weekly_evidence},
             )
 
-        slope = round(_linear_slope(weekly), 2)
-        latest = weekly[-1][1]
+        # A projection is a statement about the future, so it has to start from
+        # the present. A series that stops halfway through the window describes
+        # traffic that has since gone quiet, and "the quota is reached in about
+        # six weeks" computed from it names a date that may already be behind us.
+        latest_age_days = window.latest_age_days
+        if latest_age_days is not None and latest_age_days > _MAX_TREND_STALENESS_DAYS:
+            return self.not_applicable(
+                context,
+                reason=(
+                    f"the most recent ConcurrentCalls datapoint is {latest_age_days} days "
+                    f"old, more than the {_MAX_TREND_STALENESS_DAYS}-day staleness "
+                    "tolerance, so the historical trend cannot be projected forward as a "
+                    "current forecast"
+                ),
+                evidence={
+                    "weekly_peaks": weekly_evidence,
+                    "latest_datapoint_age_days": latest_age_days,
+                    "staleness_tolerance_days": _MAX_TREND_STALENESS_DAYS,
+                },
+            )
+
+        slope_raw, intercept = _linear_fit(weekly)
+        slope = round(slope_raw, 2)
+        latest_week, observed_latest = weekly[-1]
+        # The projection starts from the fitted value at the latest observed
+        # week, not from that week's raw peak. Taking the rate from a
+        # least-squares fit and the starting point from a single observation
+        # discards the anomaly resistance the fit was chosen for: one quiet final
+        # week would then lower the baseline, inflate the remaining headroom, and
+        # move an instance inside the horizon out of it.
+        trend_latest = round(max(0.0, intercept + slope_raw * latest_week), 1)
         # Reported alongside the observed count so a reader can see that a trend
         # fitted over four datapoints may span considerably more than four weeks.
-        weeks_spanned = weekly[-1][0] - weekly[0][0] + 1
+        weeks_spanned = latest_week - weekly[0][0] + 1
         evidence: Dict[str, Any] = {
             "instance_alias": instance.instance_alias,
             "quota_name": quota_name,
@@ -805,7 +1119,9 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
             "weeks_observed": len(weekly),
             "weeks_spanned": weeks_spanned,
             "growth_calls_per_week": slope,
-            "latest_weekly_peak": latest,
+            "latest_weekly_peak": observed_latest,
+            "trend_value_at_latest_week": trend_latest,
+            "latest_datapoint_age_days": latest_age_days,
             "horizon_weeks": _GROWTH_HORIZON_WEEKS,
         }
 
@@ -823,7 +1139,7 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
                 evidence=evidence,
             )
 
-        remaining = quota_value - latest
+        remaining = quota_value - trend_latest
         if remaining <= 0:
             weeks_to_quota = 0.0
         else:
@@ -851,7 +1167,9 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
             severity=Severity.HIGH if weeks_to_quota <= 13 else Severity.MEDIUM,
             description=(
                 f"Peak concurrent calls on instance {instance.display_name} are growing "
-                f"by {slope:.2f} per week, from a latest weekly peak of {int(latest)}. "
+                f"by {slope:.2f} per week, from a fitted current level of "
+                f"{trend_latest:.0f} calls (latest observed weekly peak "
+                f"{int(observed_latest)}). "
                 f"At that rate the {int(quota_value)}-call quota is reached in about "
                 f"{weeks_to_quota:.0f} weeks. Because quota increases are handled as "
                 "support cases rather than instantly, this needs to be raised now "

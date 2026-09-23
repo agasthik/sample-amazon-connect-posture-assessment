@@ -36,9 +36,11 @@ def _instance_with_flow(instance, flow_json, name="TestFlow", flow_type="CONTACT
 
 
 class TestDynamicPromptInjection:
-    def test_dynamic_ref_in_prompt_fails(self, make_check_context, sample_connect_instance):
+    def test_dynamic_ref_in_ssml_prompt_fails(self, make_check_context, sample_connect_instance):
+        # SSML is the tier that fails: the substituted value is parsed as markup,
+        # so a caller-supplied "<break time='9s'/>" is executed, not spoken.
         flow = build_contact_flow(
-            [build_action("a1", "MessageParticipant", {"Text": "Hello $.Attributes.Name"})]
+            [build_action("a1", "MessageParticipant", {"SSML": "Hello $.Attributes.Name"})]
         )
         inst = _instance_with_flow(sample_connect_instance, flow)
         finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
@@ -84,16 +86,27 @@ class TestDynamicPromptInjection:
         finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
         assert finding.severity == Severity.HIGH
 
-    def test_plain_text_to_caller_is_low(self, make_check_context, sample_connect_instance):
-        """No markup parsing, and the caller hears back their own value."""
+    def test_plain_text_to_caller_is_informational_not_a_failure(
+        self, make_check_context, sample_connect_instance
+    ):
+        """
+        No markup parsing, and the caller hears back their own value.
+
+        This is what ordinary personalization looks like, so failing it failed on
+        almost every instance while identifying nothing to fix. The prompt is
+        still reported — as evidence on a passing finding — so it stays traceable
+        if the attribute later comes from an external system or the prompt is
+        switched to SSML.
+        """
         flow = build_contact_flow(
             [build_action("a1", "MessageParticipant", {"Text": "Hello $.Attributes.Name"})]
         )
         inst = _instance_with_flow(sample_connect_instance, flow)
         finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.FAIL
-        assert finding.severity == Severity.LOW
-        assert finding.evidence["flagged_prompts"][0]["risk_tier"] == "spoken_to_source"
+        assert finding.status == CheckStatus.PASS
+        reported = finding.evidence["informational_prompts_spoken_to_source"]
+        assert len(reported) == 1
+        assert reported[0]["risk_tier"] == "spoken_to_source"
 
     def test_plain_text_in_agent_whisper_is_medium(
         self, make_check_context, sample_connect_instance
@@ -161,19 +174,21 @@ class TestDynamicPromptInjection:
     ):
         # A user-defined attribute (set from caller input, a Lex slot, or
         # a Lambda lookup) is NOT a system attribute and must still be
-        # flagged -- this is the actual injection risk.
+        # flagged -- this is the actual injection risk. Shown in SSML, where
+        # the substituted value is parsed rather than spoken.
         flow = build_contact_flow(
             [
                 build_action(
                     "a1",
                     "MessageParticipant",
-                    {"Text": "Hello, $.Attributes.CustomerName."},
+                    {"SSML": "Hello, $.Attributes.CustomerName."},
                 )
             ]
         )
         inst = _instance_with_flow(sample_connect_instance, flow)
         finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
         assert finding.status == CheckStatus.FAIL
+        assert finding.evidence["system_attribute_prompts_excluded"] == 0
 
     def test_mixed_system_and_caller_reference_still_fails(
         self, make_check_context, sample_connect_instance
@@ -185,13 +200,14 @@ class TestDynamicPromptInjection:
                 build_action(
                     "a1",
                     "MessageParticipant",
-                    {"Text": "Queue $.Queue.Name, customer $.Attributes.CustomerName."},
+                    {"SSML": "Queue $.Queue.Name, customer $.Attributes.CustomerName."},
                 )
             ]
         )
         inst = _instance_with_flow(sample_connect_instance, flow)
         finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
         assert finding.status == CheckStatus.FAIL
+        assert finding.evidence["system_attribute_prompts_excluded"] == 0
 
 
 # --- Lambda response validation (sec-lambda-validation-001) ---

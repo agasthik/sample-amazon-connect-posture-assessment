@@ -207,7 +207,10 @@ class DynamicPromptInjectionCheck(BaseCheck):
     3. **Plain text, spoken back to the caller who supplied it.** The caller
        hears their own value. Attacker and audience are the same person, so
        there is no attack unless an external system supplied the value —
-       worth reporting so it can be traced, not worth paging anyone: LOW.
+       worth reporting so it can be traced, not worth paging anyone. Reported
+       as evidence on a PASS, not as a failure: this tier is what ordinary
+       personalization looks like, and a check that fails on it fails on
+       almost every instance while identifying nothing to fix.
 
     Note the check reports what it can prove from flow content. It cannot
     prove where an attribute's value *originated* — Connect does not record
@@ -289,19 +292,23 @@ class DynamicPromptInjectionCheck(BaseCheck):
                     }
                 )
 
-        if flagged:
-            ssml_hits = [f for f in flagged if f["risk_tier"] == "ssml_parsed"]
-            other_audience_hits = [f for f in flagged if f["risk_tier"] == "other_audience"]
-            self_audience_hits = [f for f in flagged if f["risk_tier"] == "spoken_to_source"]
+        ssml_hits = [f for f in flagged if f["risk_tier"] == "ssml_parsed"]
+        other_audience_hits = [f for f in flagged if f["risk_tier"] == "other_audience"]
+        self_audience_hits = [f for f in flagged if f["risk_tier"] == "spoken_to_source"]
 
-            # The finding carries the worst tier present, so one SSML prompt is
-            # not diluted to LOW by a dozen harmless plain-text ones alongside.
-            if ssml_hits:
-                finding_severity = Severity.HIGH
-            elif other_audience_hits:
-                finding_severity = Severity.MEDIUM
-            else:
-                finding_severity = Severity.LOW
+        # Tier 3 on its own does not fail. The caller hears back a value they
+        # supplied, no markup is parsed, and attacker and audience are the same
+        # person — the ladder in the class docstring already calls it "not worth
+        # paging anyone". Failing on it made ordinary personalization
+        # ("Thanks for calling, $.Attributes.CustomerName") a finding, so an
+        # instance with many personalized prompts collected a run of LOW
+        # failures and a depressed pass rate for something this check does not
+        # consider exploitable. The prompts are still reported, as evidence on a
+        # passing finding, so their sources can still be traced.
+        if ssml_hits or other_audience_hits:
+            # The finding carries the worse of the two tiers present, so one
+            # SSML prompt is not diluted by a dozen plain-text ones alongside.
+            finding_severity = Severity.HIGH if ssml_hits else Severity.MEDIUM
 
             # Lead with the tier that sets the severity — that is what the
             # reader has to act on, and it should not sit below the rest.
@@ -513,11 +520,25 @@ class DynamicPromptInjectionCheck(BaseCheck):
             if system_attr_refs_seen
             else ""
         )
-        return self.create_finding(
-            status=CheckStatus.PASS,
-            resource_id=instance.instance_id,
-            resource_type="ContactFlow",
-            description=(
+        if self_audience_hits:
+            description = (
+                f"None of the {len(instance.contact_flows)} contact flow(s) "
+                "analyzed have an exploitable voice prompt injection path."
+                f"{system_attr_note}\n\n"
+                f"**{len(self_audience_hits)} prompt(s) do speak a dynamic "
+                "value back to the caller who supplied it, in plain text.** "
+                "That is ordinary personalization, and it is reported here "
+                "rather than failed: no markup is parsed, so nothing the "
+                "caller types can change what the platform says, and the only "
+                "person who hears the value is the person who provided it. It "
+                "becomes worth attention only if an external system — a "
+                "Lambda, a CRM lookup — is what sets the attribute, or if the "
+                "prompt is later switched to *Interpret as: SSML*. The full "
+                "list is in this finding's evidence so those sources can be "
+                "traced."
+            )
+        else:
+            description = (
                 f"None of the {len(instance.contact_flows)} contact flow(s) "
                 "analyzed have a voice prompt that speaks a caller- or "
                 f"external-system-sourced value.{system_attr_note} Every "
@@ -527,10 +548,19 @@ class DynamicPromptInjectionCheck(BaseCheck):
                 "looks for: `</speak><speak>` markup smuggled into an "
                 "SSML-interpreted prompt, or attacker-authored text spoken to "
                 "an agent as though the flow wrote it."
-            ),
+            )
+
+        return self.create_finding(
+            status=CheckStatus.PASS,
+            resource_id=instance.instance_id,
+            resource_type="ContactFlow",
+            description=description,
             evidence={
                 "flows_analyzed": len(instance.contact_flows),
                 "system_attribute_prompts_excluded": system_attr_refs_seen,
+                # Reported on a passing finding rather than as failures: these
+                # are traceable, not exploitable as they stand.
+                "informational_prompts_spoken_to_source": self_audience_hits,
             },
         )
 

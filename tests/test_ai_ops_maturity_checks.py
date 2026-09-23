@@ -228,6 +228,60 @@ def test_ai_guardrail_email_agent_without_guardrail_is_excluded_not_failed(
     assert observation["guardrail_capable_bound_agents"] == 0
 
 
+def test_ai_guardrail_email_only_assistant_without_any_guardrail_is_not_failed(
+    make_check_context, mock_aws_client_factory
+):
+    # Arrange — the same email-only assistant, but with no published guardrail
+    # anywhere. Failing this issued a remediation whose second step ("attach it
+    # to each agent") is impossible: EMAIL_* configurations have no guardrail
+    # member, so there is nothing to attach a guardrail to.
+    _wire_access_denied(mock_aws_client_factory)
+    factory = mock_aws_client_factory
+    factory.list_integration_associations_resilient.return_value = _assistant_association()
+    factory.list_ai_guardrails_resilient.return_value = {"aiGuardrailSummaries": []}
+    _bind_agents(factory, EMAIL_RESPONSE="agent-1")
+    factory.list_ai_agents_resilient.return_value = {
+        "aiAgentSummaries": [
+            _agent_summary("agent-1", "EMAIL_RESPONSE", "emailResponseAIAgentConfiguration")
+        ]
+    }
+
+    # Act
+    finding = AIGuardrailCoverageCheck().execute(make_check_context())
+
+    # Assert
+    assert finding.status == CheckStatus.PASS
+    assert finding.evidence["assistants_without_guardrail_capable_agents"] == 1
+    # The PASS text must not claim a guardrail was found on an assistant that
+    # cannot carry one.
+    assert "EMAIL_*" in finding.description
+    assert "All 0 of 1" in finding.description
+
+
+def test_ai_guardrail_guardrail_capable_agent_still_requires_a_published_guardrail(
+    make_check_context, mock_aws_client_factory
+):
+    # Arrange — one guardrail-capable bound agent and no published guardrail at
+    # all. The email exemption must not widen into a general one.
+    _wire_access_denied(mock_aws_client_factory)
+    factory = mock_aws_client_factory
+    factory.list_integration_associations_resilient.return_value = _assistant_association()
+    factory.list_ai_guardrails_resilient.return_value = {"aiGuardrailSummaries": []}
+    _bind_agents(factory, SELF_SERVICE="agent-1", EMAIL_RESPONSE="agent-2")
+    factory.list_ai_agents_resilient.return_value = {
+        "aiAgentSummaries": [
+            _agent_summary("agent-1", "SELF_SERVICE", "selfServiceAIAgentConfiguration"),
+            _agent_summary("agent-2", "EMAIL_RESPONSE", "emailResponseAIAgentConfiguration"),
+        ]
+    }
+
+    # Act
+    finding = AIGuardrailCoverageCheck().execute(make_check_context())
+
+    # Assert
+    assert finding.status == CheckStatus.FAIL
+
+
 def test_ai_guardrail_unbound_agent_without_guardrail_does_not_fail(
     make_check_context, mock_aws_client_factory
 ):

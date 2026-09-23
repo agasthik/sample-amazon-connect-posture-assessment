@@ -523,10 +523,26 @@ class AIGuardrailCoverageCheck(BaseCheck):
                 observation["bound_agents_not_returned_by_list"] = unresolved
             if unresolved_records:
                 observation["unresolved_bound_agents"] = unresolved_records
+            # A published guardrail is only required where something could
+            # reference it. The three EMAIL_* agent types carry no guardrail
+            # member in their configuration, so an assistant bound *only* to
+            # those cannot attach one: failing it would issue a remediation whose
+            # second step ("attach it to each agent") is impossible, and the
+            # check's own stated contract is that email agents are excluded
+            # rather than failed. Assessing enforceable coverage is the policy;
+            # requiring an unused guardrail against future agents is not.
+            #
+            # An assistant with no bound agents at all is not exempt: an empty
+            # aiAgentConfiguration means Q in Connect serves the caller with its
+            # default agents, which do take a guardrail, so the coverage gap is
+            # real even though no agent is named here.
+            observation["guardrail_not_attachable"] = bool(bound_agents) and not (
+                guarded or unguarded or unresolved_records
+            )
             observations.append(observation)
             if unguarded:
                 attachment_gaps.append(observation)
-            if not qualifying:
+            if not qualifying and not observation["guardrail_not_attachable"]:
                 uncovered.append(observation)
             if unresolved_records:
                 unverifiable.append(observation)
@@ -538,21 +554,36 @@ class AIGuardrailCoverageCheck(BaseCheck):
             "This evidence does not establish which content, denied-topic, word, or "
             "sensitive-information filters a referenced guardrail actually applies."
         )
+        # Assistants where no bound agent can carry a guardrail at all. Counted
+        # so the PASS text states what was actually assessed rather than
+        # implying a guardrail was found on an assistant that cannot use one.
+        no_capable_agents = [item for item in observations if item["guardrail_not_attachable"]]
         evidence = {
             "assistants_checked": len(assistant_arns),
             "assistant_guardrail_observations": observations,
             "unguarded_bound_agent_count": unguarded_total,
+            "assistants_without_guardrail_capable_agents": len(no_capable_agents),
             "evidence_limitation": limitation,
         }
         if not uncovered and not attachment_gaps and not unverifiable:
+            if no_capable_agents:
+                exclusion_note = (
+                    f" {len(no_capable_agents)} of them are bound only to agent types that "
+                    "carry no guardrail member — EMAIL_* — so no guardrail is enforceable "
+                    "there and none is required."
+                )
+            else:
+                exclusion_note = ""
+            assessed = len(assistant_arns) - len(no_capable_agents)
             return self.create_finding(
                 status=CheckStatus.PASS,
                 resource_id=instance.instance_id,
                 resource_type="QConnectAssistant",
                 description=(
-                    f"All {len(assistant_arns)} Q in Connect assistant(s) expose at least one "
-                    "ACTIVE and PUBLISHED AI guardrail, and every bound AI agent whose type "
-                    f"supports a guardrail references one. {limitation}"
+                    f"All {assessed} of {len(assistant_arns)} Q in Connect assistant(s) with a "
+                    "guardrail-capable bound agent expose at least one ACTIVE and PUBLISHED AI "
+                    "guardrail, and every bound AI agent whose type supports a guardrail "
+                    f"references one.{exclusion_note} {limitation}"
                 ),
                 evidence=evidence,
             )

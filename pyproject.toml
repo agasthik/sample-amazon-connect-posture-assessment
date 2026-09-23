@@ -56,7 +56,10 @@ test = [
 ]
 screenshots = [
     "playwright==1.55.0",
-    "pillow==11.3.0",
+    # >=12.3.0 clears the Pillow CVE-2026-* advisories (OOB writes,
+    # decompression bombs, command injection). Dev-only extra used by
+    # scripts/capture_screenshots.py; not a runtime dependency.
+    "pillow>=12.3.0",
 ]
 
 [project.scripts]

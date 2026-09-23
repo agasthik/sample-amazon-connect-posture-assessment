@@ -58,11 +58,11 @@ amazon-connect-assessment --region us-east-1 --output-dir ./reports
 
 ## Sample report
 
+Checkout the sample [`html report`](https://aws-samples.github.io/sample-connect-posture-assessment/examples/sample_assessment_report.html)
+
 ![Sample Amazon Connect Customer assessment report](docs/images/sample-assessment-report.png)
 
-A complete, self-contained example is checked in at
-[`examples/sample_assessment_report.html`](examples/sample_assessment_report.html) —
-open it in a browser to see the report before you run anything.
+
 
 ---
 

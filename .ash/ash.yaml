@@ -1,6 +1,9 @@
 project_name: amazon-connect-assessment
 global_settings:
   severity_threshold: MEDIUM
+  ignore_paths:
+    - path: "archive/"
+      reason: "Archive data only"
   # Findings to suppress based on rule ID, file path, and line numbers
   suppressions:
     - rule_id: "SECRET-BASE64-HIGH-ENTROPY-STRING"

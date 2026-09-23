@@ -118,17 +118,6 @@
     <script>
         // Add export functionality
         document.addEventListener('DOMContentLoaded', function () {
-            // Export JSON button
-            const exportJsonBtn = document.getElementById('export-json');
-            if (exportJsonBtn) {
-                exportJsonBtn.addEventListener('click', function () {
-                    // This will be handled by the controller
-                    if (window.assessmentReportController) {
-                        window.assessmentReportController.exportData();
-                    }
-                });
-            }
-
             // Export PDF — trigger browser print (save as PDF from print dialog)
             const exportPdfBtn = document.getElementById('export-pdf');
             if (exportPdfBtn) {
@@ -137,7 +126,8 @@
                 });
             }
 
-            // Export JSON — download findings as a JSON file
+            // Export JSON — download findings as a JSON file (controller
+            // preferred; falls back to the embedded chart-data island).
             const exportJsonDlBtn = document.getElementById('export-json');
             if (exportJsonDlBtn) {
                 exportJsonDlBtn.addEventListener('click', function () {
@@ -178,21 +168,6 @@
                     const a = document.createElement('a');
                     a.href = url;
                     a.download = 'assessment_findings.csv';
-                    a.click();
-                    URL.revokeObjectURL(url);
-                });
-            }
-
-            // Export HTML — download this report file itself
-            const exportHtmlBtn = document.getElementById('export-html');
-            if (exportHtmlBtn) {
-                exportHtmlBtn.addEventListener('click', function () {
-                    const html = document.documentElement.outerHTML;
-                    const blob = new Blob([html], {type: 'text/html'});
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'assessment_report.html';
                     a.click();
                     URL.revokeObjectURL(url);
                 });

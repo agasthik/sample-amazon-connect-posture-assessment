@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amazon-connect-assessment"
-version = "0.1.0"
+version = "1.0.0"
 description = "Assess Amazon Connect deployments against AWS Well-Architected Framework best practices"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -71,6 +71,7 @@ amazon_connect_assessment = [
     "templates/html/partials/*.html",
     "templates/css/*.css",
     "templates/js/*.js",
+    "templates/assets/*.svg",
 ]
 
 [tool.pytest.ini_options]

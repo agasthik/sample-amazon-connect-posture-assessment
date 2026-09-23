@@ -19,7 +19,18 @@
  * ============================================================================ */
 
 .journey-map-section {
+    /* Break out of the 1200px .container column so wide caller-journey
+       diagrams get the full viewport width (capped at 1800px) instead of
+       overflowing a ~1150px panel. The margin-left/transform pair recenters
+       the wider element on the viewport; text and finding sections stay at
+       1200px. 100vw - 3rem leaves room for the vertical scrollbar so this
+       never introduces a horizontal one. The absolutely positioned diagram
+       nodes are contained by .journey-map-diagram-scale (position: relative),
+       so this transform does not affect them. */
+    width: min(100vw - 3rem, 1800px);
     margin: 2rem 0 3rem;
+    margin-left: 50%;
+    transform: translateX(-50%);
     padding: 1.5rem;
     background: #ffffff;
     border-radius: 8px;
@@ -305,7 +316,11 @@
     border-radius: 4px;
     border: 1px solid #e9ecef;
     overflow: auto;
-    max-height: 700px;
+    /* Show more of a tall flow before scrolling. Viewport-relative so large
+       diagrams use the available screen height; the floor keeps the panel a
+       usable size on short windows. */
+    max-height: min(80vh, 1000px);
+    min-height: 320px;
 }
 
 .journey-map-diagram-scale {

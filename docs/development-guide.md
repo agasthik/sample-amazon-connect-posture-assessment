@@ -98,6 +98,14 @@ python scripts/validate_environment.py
 python scripts/generate_readme_html.py
 ```
 
+Regenerate `docs/images/sample-assessment-report.png` after changing the sample
+report in `examples/`:
+
+```bash
+pip install -e ".[screenshots]"
+playwright install chromium
+python scripts/capture_screenshots.py
+
 ---
 
 ## Adding a new check

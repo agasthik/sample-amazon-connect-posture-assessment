@@ -6,7 +6,7 @@ AWS Well-Architected Framework best practices for Resilience, Security,
 and Cost Optimization.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 __author__ = "Amazon Connect Assessment Team"
 
 from .analyzers import BaseAnalyzer

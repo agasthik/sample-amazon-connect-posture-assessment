@@ -195,7 +195,7 @@ class TestAssessmentEngine:
         with patch("time.time", return_value=1045.5):
             metadata = assessment_engine._generate_metadata()
 
-        assert metadata.tool_version == "0.1.0"
+        assert metadata.tool_version == "1.0.0"
         assert metadata.execution_time_seconds == 45.5
         assert metadata.aws_account_id == assessment_engine.config["account_id"]
         assert metadata.aws_region == assessment_engine.config["region"]

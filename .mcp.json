@@ -1,9 +1,17 @@
 {
-    "mcpServers": {
-        "aws-knowledge-mcp-server": {
-            "url": "https://knowledge-mcp.global.api.aws",
-            "type": "http",
-            "disabled": false
-        }
+  "mcpServers": {
+    "aws-knowledge-mcp-server": {
+      "url": "https://knowledge-mcp.global.api.aws",
+      "type": "http",
+      "disabled": false
+    },
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": [
+        "serve",
+        "--mcp"
+      ]
     }
+  }
 }

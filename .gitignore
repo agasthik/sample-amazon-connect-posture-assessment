@@ -35,7 +35,7 @@ htmlcov/
 # IDE
 .vscode/
 .idea/
-.claude/settings.local.json
+.claude/
 
 # OS
 .DS_Store
@@ -45,6 +45,7 @@ Thumbs.db
 # Generated reports (keep examples but ignore generated ones)
 reports/*
 !reports/.gitkeep
+.mcp.json
 
 # Temporary test scripts
 temp_*.py

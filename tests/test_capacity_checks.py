@@ -117,6 +117,10 @@ def _quota_responses(defaults=None, applied=None, denied=None):
             "Quotas": DEFAULT_QUOTAS if defaults is None else defaults
         },
         "list_service_quotas": {"Quotas": applied or []},
+        # No traffic distribution group by default: the instance-scoped phone
+        # number count is then complete. Tests that exercise the ACGR path
+        # override this with a non-empty summary list.
+        "list_traffic_distribution_groups": {"TrafficDistributionGroupSummaryList": []},
     }
 
 
@@ -174,13 +178,30 @@ class TestQuotaLookup:
         with pytest.raises(QuotaLookupDenied):
             get_connect_quotas(mock_aws_client_factory)
 
-    def test_partial_denial_still_returns_a_table(self, mock_aws_client_factory):
+    def test_applied_denial_alone_still_returns_the_defaults_table(self, mock_aws_client_factory):
+        # Only the applied listing is denied. The defaults still supply every
+        # ceiling, so the table is usable — the sole casualty is an unseen
+        # per-instance increase, which makes the comparison conservative rather
+        # than a silent miss.
         api = _Api(
             list_aws_default_service_quotas={"Quotas": DEFAULT_QUOTAS},
             list_service_quotas=ACCESS_DENIED,
         )
         _wire(mock_aws_client_factory, api)
         assert get_connect_quotas(mock_aws_client_factory)["Queues per instance"] == 250.0
+
+    def test_defaults_denial_alone_raises(self, mock_aws_client_factory):
+        # The dangerous asymmetry: defaults denied but applied allowed. An
+        # instance still on defaults then has no applied override, so the table
+        # is empty and every quota reads as unpublished — the silent opposite of
+        # this module's purpose. It must SKIP, not quietly report NOT_APPLICABLE.
+        api = _Api(
+            list_aws_default_service_quotas=ACCESS_DENIED,
+            list_service_quotas={"Quotas": []},
+        )
+        _wire(mock_aws_client_factory, api)
+        with pytest.raises(QuotaLookupDenied):
+            get_connect_quotas(mock_aws_client_factory)
 
     def test_table_is_cached_across_checks(self, mock_aws_client_factory):
         api = _Api(**_quota_responses())
@@ -454,6 +475,47 @@ class TestConfigurationQuotaUtilization:
         assert finding.status is CheckStatus.PASS
         assert "phone_numbers" in finding.evidence["unmeasured_resources"]
         assert "queues" in finding.evidence["measured"]
+
+    def test_phone_count_unmeasured_when_traffic_distribution_group_present(self, check_context):
+        # ListPhoneNumbersV2 against an instance ARN omits numbers claimed to a
+        # traffic distribution group, so on an ACGR instance the count is a lower
+        # bound. Comparing it would report headroom that may not exist, so the
+        # subject is dropped as unmeasured — the other subjects still stand.
+        _populate(check_context.instance)
+        api = _Api(
+            **{
+                **_quota_responses(),
+                "list_traffic_distribution_groups": {
+                    "TrafficDistributionGroupSummaryList": [{"Id": "tdg-1"}]
+                },
+            },
+            list_users=_users(10),
+            list_phone_numbers_v2={"ListPhoneNumbersSummaryList": [{}] * 5},
+        )
+        finding = self._run(check_context, api)
+        assert "phone_numbers" not in finding.evidence["measured"]
+        assert "phone_numbers" in finding.evidence["unmeasured_resources"]
+        assert finding.evidence["unmeasured_reasons"]["phone_numbers"].startswith(
+            "count_incomplete"
+        )
+        assert "queues" in finding.evidence["measured"]
+
+    def test_denied_tdg_listing_keeps_the_instance_phone_count(self, check_context):
+        # A denied or unavailable TDG listing cannot confirm ACGR is in use, so
+        # the instance-scoped count is kept rather than discarded on every
+        # ordinary (no-TDG) instance that lacks the listing permission.
+        _populate(check_context.instance)
+        api = _Api(
+            **{
+                **_quota_responses(),
+                "list_traffic_distribution_groups": ACCESS_DENIED,
+            },
+            list_users=_users(10),
+            list_phone_numbers_v2={"ListPhoneNumbersSummaryList": [{}] * 5},
+        )
+        finding = self._run(check_context, api)
+        assert "phone_numbers" in finding.evidence["measured"]
+        assert finding.evidence["measured"]["phone_numbers"]["count"] == 5
 
     def test_skips_when_quota_reads_denied(self, check_context):
         _populate(check_context.instance)
@@ -842,6 +904,30 @@ class TestCallVolumeGrowthTrend:
         # The fit still slopes up, so the baseline sits well above the dip.
         assert finding.evidence["trend_value_at_latest_week"] > 20.0
         assert finding.evidence["growth_calls_per_week"] > 0
+
+    def test_projection_divides_by_the_raw_slope_not_the_rounded_one(self, check_context):
+        # Peaks of 20/22.5/25/27.5 at weeks 0, 3, 6 and 9 fit a slope of 0.8333
+        # calls/week and a latest fitted level of 27.5, leaving 72.5 of the
+        # 100-call quota. The runway is 72.5 / 0.8333 = 87.0 weeks. Dividing by
+        # the two-decimal display slope (0.83) instead gives 87.3 — a skew that
+        # grows as the slope shrinks and can flip a finding at the horizon or
+        # severity boundary. The displayed rate is still rounded; only the
+        # projection must use the raw slope.
+        api = _Api(
+            **_quota_responses(),
+            get_metric_statistics=_metric_response(
+                [
+                    (_days_ago(63), 20.0),
+                    (_days_ago(42), 22.5),
+                    (_days_ago(21), 25.0),
+                    (_days_ago(0), 27.5),
+                ]
+            ),
+        )
+        finding = self._run(check_context, api)
+        assert finding.evidence["growth_calls_per_week"] == 0.83
+        # 87.0 (raw) is inside pytest's window; 87.3 (rounded slope) is not.
+        assert finding.evidence["projected_weeks_to_quota"] == pytest.approx(87.0, abs=0.1)
 
 
 class TestRegistration:

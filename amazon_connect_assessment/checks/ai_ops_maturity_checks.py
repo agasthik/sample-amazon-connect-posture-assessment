@@ -630,7 +630,20 @@ class AIGuardrailCoverageCheck(BaseCheck):
                 "absent guardrail reference means model output reaches agents or callers "
                 f"unfiltered. {limitation}"
             )
+            # Both populations are named in the headline and the remediation
+            # steps, so both belong in target_resources: an assistant with an
+            # unguarded bound agent and a separate assistant exposing no
+            # published guardrail at all are distinct problems, and dropping the
+            # uncovered ARNs here would hide them from any consumer that keys
+            # remediation to target_resources. Deduped and order-preserved
+            # because one assistant can land in both lists.
             flagged = [item["assistant_arn"] for item in attachment_gaps]
+            seen = set(flagged)
+            for item in uncovered:
+                arn = item["assistant_arn"]
+                if arn not in seen:
+                    seen.add(arn)
+                    flagged.append(arn)
         else:
             description = (
                 f"{len(uncovered)} of {len(assistant_arns)} Q in Connect assistant(s) do not "

@@ -62,6 +62,23 @@ class TestUsageMetricsCheck:
         finding = UsageMetricsCheck().execute(make_check_context())
         assert finding.status == CheckStatus.PASS
 
+    def test_query_carries_the_metric_group_dimension(
+        self, make_check_context, mock_aws_client_factory
+    ):
+        # CloudWatch keys ConcurrentCalls on InstanceId *and* MetricGroup, and
+        # matches a metric only on its full dimension set. Querying InstanceId
+        # alone matches nothing and returns no datapoints, which this check would
+        # misread as "unused" on every active instance — the regression pinned
+        # here is the missing MetricGroup=VoiceCalls dimension.
+        _wire(mock_aws_client_factory)
+        mock_aws_client_factory.call_api_with_resilience.return_value = {
+            "Datapoints": [{"Maximum": 10, "Average": 5}]
+        }
+        UsageMetricsCheck().execute(make_check_context())
+        dimensions = mock_aws_client_factory.call_api_with_resilience.call_args.kwargs["Dimensions"]
+        assert {"Name": "MetricGroup", "Value": "VoiceCalls"} in dimensions
+        assert any(d["Name"] == "InstanceId" for d in dimensions)
+
 
 class TestPremiumFeaturesCostCheck:
     def test_enabled_feature_fails(self, make_check_context, mock_aws_client_factory):

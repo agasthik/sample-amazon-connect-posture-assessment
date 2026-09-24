@@ -270,13 +270,22 @@ def _build_quota_table(factory: Any) -> Dict[str, _QuotaRecord]:
     the response carries account-level values only.
 
     Raises:
-        QuotaLookupDenied: if both reads are denied, so the caller can emit a
-            SKIPPED finding naming the missing permission rather than a
-            misleading PASS.
+        QuotaLookupDenied: if the defaults read is denied, so the caller can
+            emit a SKIPPED finding naming the missing permission rather than a
+            misleading conclusion. The defaults listing is the backbone of the
+            table — it is the only source of a ceiling for an instance still on
+            AWS defaults, which is the population most likely to be near a limit.
+            Losing it leaves that instance with no published quota, which the
+            checks would report as NOT_APPLICABLE ("no quota published") — the
+            silent opposite of the coverage this module exists to provide. A
+            denial of the applied listing alone is not raised: the defaults still
+            give every ceiling, and the only casualty is an unseen per-instance
+            increase, which makes the comparison conservative (a possible false
+            warning) rather than a silent miss.
     """
     defaults: List[Dict[str, Any]] = []
     applied: List[Dict[str, Any]] = []
-    denied = 0
+    defaults_denied = False
 
     for operation, sink, extra in (
         ("list_aws_default_service_quotas", defaults, {}),
@@ -288,12 +297,13 @@ def _build_quota_table(factory: Any) -> Dict[str, _QuotaRecord]:
             raise
         except Exception as exc:
             if factory.is_access_denied(exc):
-                denied += 1
+                if sink is defaults:
+                    defaults_denied = True
                 continue
             raise
 
-    if denied == 2:
-        raise QuotaLookupDenied("Service Quotas reads denied")
+    if defaults_denied:
+        raise QuotaLookupDenied("Service Quotas defaults read denied")
 
     # Indexed by name, which is what the keyword matcher works on, while the
     # code is carried through so a record can be tied back to the quota AWS
@@ -619,6 +629,34 @@ def _list_phone_number_count(factory: Any, target_arn: str) -> int:
     return total
 
 
+def _instance_has_traffic_distribution_groups(factory: Any, instance_id: str) -> bool:
+    """
+    Return whether any traffic distribution group is created from this instance.
+
+    Used to decide whether the instance-scoped phone-number count is complete.
+    ListPhoneNumbersV2 given an instance ARN returns only the numbers claimed to
+    the instance; numbers claimed to a traffic distribution group come back only
+    when the TDG ARN is passed. So on an ACGR instance the instance-scoped count
+    is a lower bound, and whether a TDG-claimed number counts toward the
+    per-instance ceiling at all is not something the API states — which is why
+    the caller drops the subject as unmeasured rather than summing the TDGs
+    (that would risk inventing a breach as readily as this undercount hides one).
+
+    Presence, not count, is all that is needed, so the first page settles it and
+    no pagination is required. Raises on error so the caller can keep the
+    instance-scoped count when a TDG listing is merely denied or unavailable —
+    the common instance-with-no-TDG case must stay measured.
+    """
+    response = factory.call_api_with_resilience(
+        factory.get_connect_client(),
+        "list_traffic_distribution_groups",
+        "connect",
+        InstanceId=instance_id,
+        MaxResults=10,
+    )
+    return bool(response.get("TrafficDistributionGroupSummaryList") or [])
+
+
 def _list_user_count(factory: Any, instance_id: str) -> int:
     """
     Count every user configured on an instance.
@@ -723,6 +761,28 @@ class ConfigurationQuotaUtilizationCheck(BaseCheck):
                 if not factory.is_access_denied(exc):
                     raise
                 unmeasured[key] = "access_denied"
+
+        # A phone-number count taken against the instance ARN omits any number
+        # claimed to a traffic distribution group the instance participates in,
+        # so on an ACGR instance it is a lower bound against the per-instance
+        # ceiling. Comparing it anyway would report headroom that may not exist,
+        # so a confirmed TDG turns the subject into an unmeasured one — the same
+        # treatment a page-bounded count already gets.
+        if "phone_numbers" in counts:
+            try:
+                if _instance_has_traffic_distribution_groups(factory, instance.instance_id):
+                    del counts["phone_numbers"]
+                    unmeasured["phone_numbers"] = (
+                        "count_incomplete: instance participates in a traffic distribution "
+                        "group, whose claimed numbers an instance-scoped listing omits"
+                    )
+            except Exception:
+                # A denied or unavailable TDG listing cannot confirm ACGR is in
+                # use. The instance-scoped count is kept rather than discarded:
+                # the common case is an instance with no TDG, where that count is
+                # exact, and dropping it on every such account would strip the
+                # phone-number subject far more widely than the ACGR edge needs.
+                pass
 
         return counts, unmeasured
 
@@ -1099,6 +1159,12 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
             )
 
         slope_raw, intercept = _linear_fit(weekly)
+        # slope is the raw fitted rate rounded for display only; every decision
+        # below (the flat-or-declining guard and the weeks-to-quota projection)
+        # is taken from slope_raw. Deriving the numerator from the raw slope but
+        # dividing by the rounded one skews the projection — worst for small
+        # growth rates, where rounding 0.006 to 0.01 nearly halves the runway and
+        # can push an instance across the horizon or severity boundary.
         slope = round(slope_raw, 2)
         latest_week, observed_latest = weekly[-1]
         # The projection starts from the fitted value at the latest observed
@@ -1125,7 +1191,7 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
             "horizon_weeks": _GROWTH_HORIZON_WEEKS,
         }
 
-        if slope <= 0:
+        if slope_raw <= 0:
             return self.create_finding(
                 status=CheckStatus.PASS,
                 resource_id=instance.instance_id,
@@ -1143,7 +1209,7 @@ class CallVolumeGrowthTrendCheck(BaseCheck):
         if remaining <= 0:
             weeks_to_quota = 0.0
         else:
-            weeks_to_quota = round(remaining / slope, 1)
+            weeks_to_quota = round(remaining / slope_raw, 1)
         evidence["projected_weeks_to_quota"] = weeks_to_quota
 
         if weeks_to_quota > _GROWTH_HORIZON_WEEKS:

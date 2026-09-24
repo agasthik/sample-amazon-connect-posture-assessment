@@ -172,6 +172,59 @@ def test_ai_guardrail_bound_agent_without_guardrail_fails_despite_published_guar
     assert "agent-1" in finding.structured_remediation.steps[0].instruction
 
 
+def test_ai_guardrail_target_resources_cover_both_gap_and_uncovered_assistants(
+    make_check_context, mock_aws_client_factory
+):
+    # Two assistants fail for different reasons: a1 has a bound agent that
+    # references no guardrail (an attachment gap), a2 exposes no ACTIVE/PUBLISHED
+    # guardrail at all (uncovered). The headline and remediation steps name both
+    # populations, so target_resources must carry both ARNs — dropping the
+    # uncovered assistant would hide it from any consumer keying remediation to
+    # target_resources.
+    _wire_access_denied(mock_aws_client_factory)
+    factory = mock_aws_client_factory
+    arn_gap = "arn:aws:wisdom:us-east-1:123:assistant/a1"
+    arn_uncovered = "arn:aws:wisdom:us-east-1:123:assistant/a2"
+    factory.list_integration_associations_resilient.return_value = {
+        "IntegrationAssociationSummaryList": [
+            {"IntegrationType": "WISDOM_ASSISTANT", "IntegrationArn": arn_gap},
+            {"IntegrationType": "WISDOM_ASSISTANT", "IntegrationArn": arn_uncovered},
+        ]
+    }
+
+    def _guardrails(assistant_id, **kwargs):
+        # a1 has a published guardrail; a2 has none at all.
+        return _published_guardrail() if assistant_id == "a1" else {"aiGuardrailSummaries": []}
+
+    def _assistant(assistant_id, **kwargs):
+        # a1 binds a self-service agent; a2 binds nothing.
+        if assistant_id == "a1":
+            return {
+                "assistant": {"aiAgentConfiguration": {"SELF_SERVICE": {"aiAgentId": "agent-1"}}}
+            }
+        return {"assistant": {}}
+
+    def _agents(assistant_id, **kwargs):
+        if assistant_id == "a1":
+            return {
+                "aiAgentSummaries": [
+                    _agent_summary("agent-1", "SELF_SERVICE", "selfServiceAIAgentConfiguration")
+                ]
+            }
+        return {"aiAgentSummaries": []}
+
+    factory.list_ai_guardrails_resilient.side_effect = _guardrails
+    factory.get_qconnect_assistant_resilient.side_effect = _assistant
+    factory.list_ai_agents_resilient.side_effect = _agents
+
+    finding = AIGuardrailCoverageCheck().execute(make_check_context())
+
+    assert finding.status == CheckStatus.FAIL
+    targets = finding.structured_remediation.target_resources
+    assert arn_gap in targets
+    assert arn_uncovered in targets
+
+
 def test_ai_guardrail_bound_agent_with_guardrail_passes(
     make_check_context, mock_aws_client_factory
 ):

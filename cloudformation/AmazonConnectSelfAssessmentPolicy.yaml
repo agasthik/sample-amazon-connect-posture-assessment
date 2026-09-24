@@ -287,8 +287,12 @@ Resources:
             Effect: Allow
             Action:
               # qconnect is the boto3 service name; wisdom is the IAM prefix.
+              # GetAIAgent resolves a bound agent that ListAIAgents omits
+              # (version-pinned or SYSTEM).
+              - wisdom:GetAIAgent
               - wisdom:GetAssistant
               - wisdom:GetKnowledgeBase
+              - wisdom:ListAIAgents
               - wisdom:ListAIGuardrails
               - wisdom:ListAIPrompts
             # Assistant and knowledge-base IDs are discovered at runtime.
@@ -301,6 +305,21 @@ Resources:
               - bedrock:ListInferenceProfiles
             # Account/region-level read APIs used only after Q applicability
             # has been established for the Connect instance.
+            Resource: '*'
+
+          - Sid: ServiceQuotasReadAccess
+            Effect: Allow
+            Action:
+              - servicequotas:ListServiceQuotas
+              - servicequotas:GetServiceQuota
+              # The default-quota reads matter as much as the applied ones: an
+              # instance that has never requested an increase has no applied
+              # quota at all, so without these the res-quota-* checks degrade
+              # to SKIPPED on exactly the deployments closest to a ceiling.
+              - servicequotas:ListAWSDefaultServiceQuotas
+              - servicequotas:GetAWSDefaultServiceQuota
+            # Service Quotas read APIs are scoped by service code rather than
+            # by resource ARN, so '*' is the only value IAM accepts.
             Resource: '*'
 
   AmazonConnectAssessmentGroup:

@@ -54,7 +54,6 @@ _EFFORT_MAP_HIGH = {
     "res-acgr-traffic-dist-001",
     "res-acgr-failover-test-001",
     "res-acgr-numbers-001",
-    "sec-ai-cascade-001",
     "sec-excessive-agency-001",
 }
 _EFFORT_MAP_LOW = {

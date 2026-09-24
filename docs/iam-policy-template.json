@@ -175,8 +175,10 @@
             "Sid": "QConnectAIOpsReadAccess",
             "Effect": "Allow",
             "Action": [
+                "wisdom:GetAIAgent",
                 "wisdom:GetAssistant",
                 "wisdom:GetKnowledgeBase",
+                "wisdom:ListAIAgents",
                 "wisdom:ListAIGuardrails",
                 "wisdom:ListAIPrompts"
             ],
@@ -188,6 +190,17 @@
             "Action": [
                 "bedrock:GetModelInvocationLoggingConfiguration",
                 "bedrock:ListInferenceProfiles"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ServiceQuotasReadAccess",
+            "Effect": "Allow",
+            "Action": [
+                "servicequotas:ListServiceQuotas",
+                "servicequotas:GetServiceQuota",
+                "servicequotas:ListAWSDefaultServiceQuotas",
+                "servicequotas:GetAWSDefaultServiceQuota"
             ],
             "Resource": "*"
         }

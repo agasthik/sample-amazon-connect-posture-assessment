@@ -49,10 +49,12 @@ def register_all_checks(
     """
     from .ai_agent_security_checks import register_ai_agent_security_checks
     from .ai_ops_maturity_checks import register_ai_ops_maturity_checks
+    from .capacity_checks import register_capacity_checks
     from .contact_flow_behavior_checks import register_contact_flow_behavior_checks
     from .contact_flow_security_checks import register_contact_flow_security_checks
     from .cost_containment_checks import register_cost_containment_checks
     from .cost_intelligence_checks import register_cost_intelligence_checks
+    from .lex_security_checks import register_lex_security_checks
     from .mvp_checks import register_mvp_checks
     from .operational_excellence_checks import register_operational_excellence_checks
     from .performance_efficiency_checks import register_performance_efficiency_checks
@@ -67,6 +69,11 @@ def register_all_checks(
     register_cost_intelligence_checks(registry)
     register_operational_excellence_checks(registry)
     register_ai_ops_maturity_checks(registry)
+    register_lex_security_checks(registry)
+
+    # Service-quota headroom. Registered under Resilience (Well-Architected
+    # REL01 covers quota management) and needs no flow parsing.
+    register_capacity_checks(registry)
 
     # Resilience includes both instance-level checks and a flow-dependent
     # Lambda call-site check. Keep the latter aligned with --skip-flow-analysis.

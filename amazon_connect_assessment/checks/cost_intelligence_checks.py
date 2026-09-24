@@ -22,6 +22,13 @@ from ..models import (
 )
 from .base import BaseCheck, CheckContext
 
+# Amazon Connect publishes ConcurrentCalls keyed on InstanceId *and* MetricGroup,
+# and CloudWatch matches a metric only on its complete dimension set. Querying
+# InstanceId alone matches no metric and returns an empty datapoint list, which
+# this check would misread as "the instance carried no traffic" on a busy
+# instance — reporting every active instance as possibly unused.
+_CONCURRENT_CALLS_METRIC_GROUP = "VoiceCalls"
+
 
 class UsageMetricsCheck(BaseCheck):
     """Analyze CloudWatch usage metrics for over-provisioning (Req 13)."""
@@ -54,7 +61,10 @@ class UsageMetricsCheck(BaseCheck):
                 "cloudwatch",
                 Namespace="AWS/Connect",
                 MetricName="ConcurrentCalls",
-                Dimensions=[{"Name": "InstanceId", "Value": instance.instance_id}],
+                Dimensions=[
+                    {"Name": "InstanceId", "Value": instance.instance_id},
+                    {"Name": "MetricGroup", "Value": _CONCURRENT_CALLS_METRIC_GROUP},
+                ],
                 StartTime=start.isoformat(),
                 EndTime=end.isoformat(),
                 Period=86400,

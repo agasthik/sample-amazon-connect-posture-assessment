@@ -205,8 +205,8 @@ caller journey findings.
 
 | Pillar | Checks | Representative coverage |
 |---|---:|---|
-| Security | 22 | Storage and KMS encryption, CloudTrail audit coverage, IAM service-role least privilege, security-profile audit, CCP approved origins, toll fraud, prompt injection, sensitive data in contact attributes, unvalidated Lambda and Lex outputs, AI cascade risk, Amazon Q guardrails and encryption |
-| Resilience | 13 | Amazon Connect Global Resiliency posture (identity type, traffic distribution group status and split, failover testing, phone-number binding), CloudWatch alarms, flow error handling, loop detection, carrier diversity, per-call-site Lambda dependency risk, Bedrock cross-region inventory |
+| Security | 19 | Storage and KMS encryption, CloudTrail audit coverage, IAM service-role least privilege, security-profile audit, CCP approved origins, toll fraud, prompt injection rated by exploitability, sensitive data in contact attributes, unvalidated Lambda output, Lex conversation-log encryption, Amazon Q guardrail attachment and encryption |
+| Resilience | 16 | Amazon Connect Global Resiliency posture (identity type, traffic distribution group status and split, failover testing, phone-number binding), concurrent-call quota headroom and growth projection, configuration-object quota utilization, CloudWatch alarms, flow error handling, loop detection, carrier diversity, per-call-site Lambda dependency risk, Bedrock cross-region inventory |
 | Cost Optimization | 15 | Unused claimed numbers, self-service containment, callback opportunities, IVR data continuity into the agent screen pop, DTMF-only self-service tiers, idle configuration, hours-of-operation mismatch, premium-feature enablement, Amazon Q model cost review |
 | Operational Excellence | 6 | Contact flow logging, early media, SSML voice fallback, unreachable-block analysis, Amazon Q knowledge-base lifecycle and ingestion health, Bedrock invocation logging |
 | Performance Efficiency | 3 | Route-aware Lambda usage, sequential Lambda invocations, descriptive flow-complexity metrics |

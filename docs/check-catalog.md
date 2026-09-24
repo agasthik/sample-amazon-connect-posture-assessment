@@ -12,8 +12,8 @@ Run `amazon-connect-assessment --list-checks` for the live list at any time.
 
 ## Table of Contents
 
-- [Security](#security--22-checks)
-- [Resilience](#resilience--13-checks)
+- [Security](#security--19-checks)
+- [Resilience](#resilience--16-checks)
 - [Caller Journey Map](#caller-journey-map-report-section-not-a-check)
 - [Cost Optimization](#cost-optimization--15-checks)
 - [Operational Excellence](#operational-excellence--6-checks)
@@ -28,7 +28,7 @@ Run `amazon-connect-assessment --list-checks` for the live list at any time.
 
 ---
 
-## Security — 22 checks
+## Security — 19 checks
 
 | Check ID | Severity | What it evaluates |
 |---|---|---|
@@ -39,30 +39,39 @@ Run `amazon-connect-assessment --list-checks` for the live list at any time.
 | `sec-origins-001` | High / Low | Approved origins allowlist is a domain allowlist for CCP embedding. FAIL at HIGH for wildcards / localhost / broad entries. FAIL at LOW when no allowlist is set — a defect only for customers embedding CCP in a custom agent app; otherwise the safe default. |
 | `sec-cloudtrail-001` | High | At least one CloudTrail trail captures Connect management events for audit completeness |
 | `sec-profile-audit-001` | High | Non-administrator security profiles don't grant admin-level capabilities |
-| `sec-prompt-inject-001` | High | Unsanitized dynamic content (contact attributes, Lambda returns) is not inserted into voice prompts or SSML |
+| `sec-prompt-inject-001` | High / Medium | Caller- or external-system-sourced values spoken in voice prompts without sanitization. HIGH when the prompt is interpreted as **SSML** (Polly parses markup out of the substituted value, so `</speak><speak>` changes what the platform says). MEDIUM for plain text in a whisper/hold/transfer flow, where an **agent** hears caller-authored text as though Connect wrote it. Plain text spoken back to the caller who supplied it does **not** fail: no markup parsing and no second party, so it is reported as evidence on a passing finding (`informational_prompts_spoken_to_source`) for traceability. That tier is what ordinary personalization looks like — `"Thanks for calling, $.Attributes.CustomerName"` — and failing on it failed on almost every instance while identifying nothing to fix. Cannot determine a value's origin, so it says so and excludes Connect system attributes. |
 | `sec-sensitive-data-001` | High | Contact flows don't store PII or credentials in contact attributes (visible in CTRs and logs) |
 | `sec-pii-prompts-001` | High | Flows don't read back sensitive customer data (account numbers, SSN) in voice without masking |
-| `sec-output-handling-001` | High | Lambda/Lex outputs that reach prompts, transfers, or downstream invocations have intermediate validation |
-| `sec-ai-lex-001` | High | Lex bot integrations have input validation or guardrail configuration to prevent prompt injection |
 | `sec-excessive-agency-001` | High | Lambda functions invoked by contact flows don't have overly broad execution role permissions |
-| `ai-ops-guardrail-001` | High | Each associated Q in Connect assistant exposes at least one guardrail summary that is both ACTIVE and PUBLISHED. `wisdom:ListAIGuardrails` proves assistant-scoped availability only; it does not prove AI-agent attachment, enforcement, or specific content/PII filter configuration. |
+| `ai-ops-guardrail-001` | High | Each associated Q in Connect assistant exposes at least one guardrail summary that is both ACTIVE and PUBLISHED, **and** every AI agent bound to that assistant references a guardrail in its own configuration. Attachment is read from `GetAssistant.aiAgentConfiguration` (the agents actually serving traffic) joined to each agent's `*AIGuardrailId` in `ListAIAgents`. A version-pinned or SYSTEM binding that `ListAIAgents` does not return is read individually with `GetAIAgent`; if it still cannot be read the check is **Skipped**, never Passed, because the claim it makes covers every bound agent. The three `EMAIL_*` agent types have no guardrail member in the API, so they are excluded rather than failed: an assistant bound *only* to those agent types is not failed for having no published guardrail, because the remediation ("attach it to each agent") would be impossible there. An assistant with no bound agents at all is still assessed — an empty `aiAgentConfiguration` means Q in Connect serves the caller with its default agents, which do take a guardrail. Does not prove which content, denied-topic, word, or sensitive-information filters a referenced guardrail applies. |
 | `security-data-001` | Medium | Data retention policies, access logging, and privacy controls are configured |
 | `sec-lambda-validation-001` | Medium | Contact flows that branch on Lambda return values validate the response shape before branching |
-| `sec-ai-lambda-001` | Medium | Lambda functions invoking AI/ML services (Bedrock, SageMaker, Comprehend) are flagged for IAM review |
-| `sec-ai-cascade-001` | Medium | Flows chaining 2+ AI components (Lex bot, then a Lambda calling Bedrock/SageMaker/Comprehend, etc.) with no output check between stages — one bad output can propagate unchecked into the next |
+| `sec-lex-convlogs-001` | Medium | Amazon Lex V2 conversation logging for the bots associated with the instance. FAILs when audio logging writes caller recordings to S3 with no `kmsKeyArn`, so access to the recordings is not gated by a key policy you control. Text logging is reported as inventory, not judged: `CloudWatchLogGroupLogDestination` has no KMS member, so whether the log group is encrypted is not knowable from Lex — the finding says so and points at `logs:DescribeLogGroups`. Returns Not Applicable when no Lex V2 bot is associated, naming any Lex V1 bot found. **Lex V1 conversation logs are not evaluated.** |
 | `ai-ops-encryption-001` | Medium | Associated Q in Connect assistants and knowledge bases report a customer-managed KMS key in `serverSideEncryptionConfiguration.kmsKeyId` via `wisdom:GetAssistant` and `wisdom:GetKnowledgeBase` |
 | `sec-federation-001` | Low | Reports identity management type as an informational prompt — SAML federation and Connect-managed identity paired with a third-party IdP (Okta, Entra ID) for MFA are both viable; this doesn't mandate one |
 | `sec-flow-auth-001` | Low | Contact flows routing to agent queues without an upstream authentication step — optional and depends on whether the destination queue exposes sensitive account operations; AWS's default sample flows are excluded |
 | `cx-personalization-001` | Low | Personalization patterns and transfer types per flow (CX quality signal, informational) |
 
-**Note on removed security checks:** two earlier checks were removed after user feedback that they emitted HIGH-severity failures without inspecting the thing they claimed to check.
+**Note on removed security checks:** six checks have been removed rather than left in the registry. Two emitted HIGH-severity failures without inspecting the thing they claimed to check; two duplicated a check that already measured the same condition; two could not tell a healthy configuration from a broken one.
+
+*Placeholders that shipped as findings:*
 
 * `security-encryption-001` (`EncryptionConfigurationCheck`) failed HIGH for every S3 or Lambda integration with the string "requires encryption validation" — but it never fetched the buckets' encryption configuration or the functions' environment encryption. It was a placeholder that shipped as a finding. Real signal now comes from `sec-storage-001`, which actually calls `ListInstanceStorageConfigs` and checks each storage type's encryption settings.
 * `security-network-001` (`NetworkSecurityCheck`) failed HIGH for `CONNECT_MANAGED` identity ("ensure strong password policies") and for having both inbound + outbound calling enabled ("ensure proper access controls"). Neither is a network-security defect — the first is an identity choice, the second is the majority Amazon Connect Customer deployment shape. The check inspected zero actual network configuration. Identity-federation posture is now covered by `sec-federation-001`, which is honest about being an identity check and, per reviewer feedback, no longer implies SAML is the only acceptable option — Connect-managed identity paired with a third-party IdP for MFA is also viable.
 
+*Duplicates of checks that already measure the condition:*
+
+* `sec-output-handling-001` (`OutputHandlingInjectionCheck`) produced no detection that another check did not already report. Its "external data → prompt" arm fired on prompts that `sec-prompt-inject-001` already flags at the same HIGH severity; its "external data → dynamic transfer" arm used the same `_is_dynamic_reference` test as `sec-toll-fraud-001`, which reports those transfers at CRITICAL. Every path it found was a second finding for a condition already on the report.
+* `sec-ai-lambda-001` (`LambdaAIPathwayCheck`) took the same input as `sec-excessive-agency-001` (Lambda ARNs harvested from flow content), concerned the same subject (execution-role privilege), and recommended the same fix (scope the role down) — but it name-matched the ARN and asked the reader to go review the role, where `sec-excessive-agency-001` resolves the role and reads its inline policies. A weaker duplicate of a check that already measures the thing.
+
+*Unable to distinguish a healthy configuration from a broken one:*
+
+* `sec-ai-lex-001` (`LexBotGuardrailCheck`) failed every Lex integration it found, unconditionally, because it could not read a bot's configuration. A deployment with correctly guarded bots received the same HIGH finding as one with none, which makes the finding unactionable. Reimplementing it requires intent and slot configuration (`lex:ListIntents`, `lex:DescribeIntent`, `lex:ListSlots`, `lex:DescribeSlot`) — read-only APIs that this policy does not currently grant. **Amazon Lex guardrail posture is therefore not currently assessed.** What *is* assessed is where a bot's conversations end up: `sec-lex-convlogs-001` reads `conversationLogSettings` at the alias level, which needs only `lex:DescribeBotAlias` — already granted.
+* `sec-ai-cascade-001` (`MultiAICascadeCheck`) asked a sound question — whether one model's output becomes the next model's input with nothing validating in between — but identified AI stages by substring-matching the Lambda ARN against hints including `"ai"` and `"ml"`. Those match unrelated function names such as `ClaimLookup`, `EmailHandler`, or `HtmlFormatter`, while any AI Lambda whose name does not advertise itself was missed entirely: both false positives and false negatives from the same heuristic. Reimplementing it means deriving AI involvement from the execution role's granted actions, the way `sec-excessive-agency-001` already resolves roles — which needs no additional permissions.
+
 ---
 
-## Resilience — 13 checks
+## Resilience — 16 checks
 
 | Check ID | Severity | What it evaluates |
 |---|---|---|
@@ -73,6 +82,9 @@ Run `amazon-connect-assessment --list-checks` for the live list at any time.
 | `res-acgr-failover-test-001` | High | When ACGR is configured, CloudTrail shows at least one `UpdateTrafficDistribution` event in the last 90 days — evidence the failover path has been exercised recently. |
 | `res-acgr-numbers-001` | High | When ACGR is configured, inbound phone numbers are claimed against a TDG ARN rather than the instance ARN. Numbers bound directly to the instance do not fail over. |
 | `res-cloudwatch-001` | High | CloudWatch alarms exist for critical Connect metrics (ConcurrentCalls, ThrottledCalls, MissedCalls, CallsPerInterval) |
+| `res-quota-headroom-001` | High | Peak concurrent calls over the last 30 days against the concurrent-active-calls quota. Fails above 80% utilization and escalates to Critical above 95%. **Not Applicable** when the instance carried no call traffic in the window. |
+| `res-quota-growth-001` | Medium | Least-squares trend on weekly peak concurrent calls over 90 days, projected against the concurrent-calls quota. The trend is fitted against each week's elapsed index, so a week with no datapoint widens the span rather than counting as the next consecutive week. Weekly buckets are measured backwards from the end of the window, so the most recent bucket always covers a full seven days and the short remainder falls at the old end, where it is dropped rather than under-reporting a peak. The projection starts from the *fitted* level at the latest observed week, not that week's raw peak, so one quiet or spiky final week cannot move the runway. Fails when the ceiling is within 26 weeks (High within 13). **Not Applicable** below four weeks of data, and also when the most recent datapoint is more than 14 days old — a trend that has stopped running is history, and projecting a deadline from it states a date that may already have passed. |
+| `res-quota-config-001` | Medium | Users, queues, routing profiles, security profiles, flows, and claimed phone numbers against their per-instance quotas, resolved **per instance**: a resource-level applied quota (matched on the instance ARN or ID in `QuotaContext.ContextId`) outranks the account-level applied value, which outranks the AWS default. Two instances in one region can therefore sit under different ceilings. Fails above 80% utilization on any subject. Users are counted from `connect:ListUsers` and claimed numbers from `connect:ListPhoneNumbersV2`; the rest come from instance discovery, where an empty collection is reported as *unmeasured* rather than as 0% — a count of zero there means discovery was denied, not that the instance is empty. A paginated count that hits its page bound with pages still outstanding is also *unmeasured*, with the reason recorded: a partial count over a quota is a utilization figure that can only be too low, which is the direction that turns a breach into a PASS. If the Service Quotas listing itself is truncated the whole check is **Skipped**, because an applied value may be missing for a quota whose default was read. |
 | `res-flow-errors-001` | High | Error-capable actions in contact flows have defined error transitions (no dead-end paths) |
 | `res-carrier-diversity-001` | Medium | Phone numbers span more than one country, or a traffic distribution group is present. FAIL remediation points to Amazon Connect Global Resiliency (ACGR) rather than claiming numbers in another country, which is rarely realistic |
 | `res-flow-loops-001` | Medium | No unbounded cycle patterns in contact flows that could trap callers |
@@ -81,6 +93,8 @@ Run `amazon-connect-assessment --list-checks` for the live list at any time.
 | `ai-ops-cross-region-001` | Low | For instances with a Q assistant integration, reports system-defined Bedrock inference profiles in the account/region as planning context. The result proves availability only, not that the Q workload uses cross-region inference; without a Q assistant integration, the check is Not Applicable. |
 
 **About the `res-acgr-*` set:** the six checks work together. When ACGR is configured, `res-acgr-config-001` returns PASS with the TDG names in the evidence, and the five audit sub-checks evaluate identity, TDG status, traffic distribution, failover testing, and phone-number binding. When ACGR is not configured, every check in the set returns **Not Applicable** — instances without ACGR see no findings, no observations, no clutter about ACGR at all. This deliberate design means the tool never nags customers who don't need ACGR, but catches half-configured ACGR — which is worse than no ACGR because the customer believes they have DR they don't.
+
+**About the `res-quota-*` set:** these are capacity checks, and they live under Resilience rather than in a separate capacity pillar because Well-Architected already covers this ground — REL01 is "Manage Service Quotas and Constraints", and REL01-BP06 is specifically "ensure sufficient gap between quota and maximum usage". They matter because Connect's per-instance limits are hard, are invisible in the Connect console, and fail as an outage rather than as a slowdown: callers get busy signals once concurrent calls are capped, and administrators cannot create users, queues, or flows once those ceilings are reached. All three read AWS default quotas as well as applied quotas, because an instance that has never requested an increase has no applied quota at all — and that is the population most likely to be near a ceiling.
 
 **Note on removed resilience checks:** three earlier checks (`resilience-multi-az-001`, `resilience-dr-001`, and `resilience-failover-001`) were removed after user feedback that they fired on trivially-true conditions and asserted things the tool cannot verify — contact-flow export cadence, multi-AZ configuration that AWS manages automatically, and routing-profile counts (having only one routing profile isn't a resilience deficiency, it's a deployment shape). Substantive resilience signal now lives in the `res-acgr-*` set and the flow-content checks in `contact_flow_behavior_checks.py`.
 
@@ -210,16 +224,20 @@ Common permissions that cause skips if missing:
 | `cloudtrail:DescribeTrails` | `sec-cloudtrail-001` |
 | `cloudtrail:LookupEvents` | `res-acgr-failover-test-001` |
 | `cloudwatch:DescribeAlarms` | `res-cloudwatch-001` |
+| `servicequotas:ListServiceQuotas`, `servicequotas:ListAWSDefaultServiceQuotas` | all three `res-quota-*` checks |
+| `cloudwatch:GetMetricStatistics` | `res-quota-headroom-001`, `res-quota-growth-001`, `cost-usage-metrics-001` |
 | `connect:ListTrafficDistributionGroups` | all `res-acgr-*`, `res-carrier-diversity-001` |
 | `connect:DescribeTrafficDistributionGroup` | `res-acgr-tdg-status-001` |
 | `connect:GetTrafficDistribution` | `res-acgr-traffic-dist-001` |
 | `connect:ListPhoneNumbersV2`, `connect:ListFlowAssociations` | `journey-sec-001`, `journey-cost-001`, `journey-res-001`, `journey-scope-001` |
+| `connect:ListUsers` | `res-quota-config-001` |
 | `connect:ListIntegrationAssociations` | all six `ai-ops-*` checks |
+| `connect:ListBots`, `lex:DescribeBotAlias` | `sec-lex-convlogs-001` |
 | `iam:GetRolePolicy` | `sec-iam-deep-001`, `sec-excessive-agency-001` |
-| `lambda:GetPolicy` | `sec-ai-lambda-001`, `sec-excessive-agency-001` |
+| `lambda:GetPolicy` | `sec-excessive-agency-001` |
 | `lambda:GetFunction` | `res-lambda-dependency-001` |
 | `kms:DescribeKey` | `sec-storage-001` |
-| `wisdom:ListAIGuardrails` | `ai-ops-guardrail-001` |
+| `wisdom:ListAIAgents`, `wisdom:ListAIGuardrails`, `wisdom:GetAIAgent` | `ai-ops-guardrail-001` |
 | `wisdom:GetAssistant` | `ai-ops-encryption-001` |
 | `wisdom:GetKnowledgeBase` | `ai-ops-encryption-001`, `ai-ops-kb-sync-001` |
 | `wisdom:ListAIPrompts` | `ai-ops-model-cost-001` |

@@ -266,8 +266,14 @@ POLICY_STATEMENTS: List[Dict[str, object]] = [
     _statement(
         "QConnectAIOpsReadAccess",
         [
+            # Resolves a bound AI agent that ListAIAgents does not return — a
+            # version-pinned or SYSTEM agent. Without it the guardrail check
+            # cannot read that agent's configuration and degrades to Skipped
+            # rather than reporting coverage it has not verified.
+            "wisdom:GetAIAgent",
             "wisdom:GetAssistant",
             "wisdom:GetKnowledgeBase",
+            "wisdom:ListAIAgents",
             "wisdom:ListAIGuardrails",
             "wisdom:ListAIPrompts",
         ],
@@ -284,6 +290,23 @@ POLICY_STATEMENTS: List[Dict[str, object]] = [
         ],
         # "*": these read-only Bedrock APIs inspect account/region-level
         # configuration and inventory rather than a known resource ARN.
+        "*",
+    ),
+    _statement(
+        "ServiceQuotasReadAccess",
+        [
+            "servicequotas:ListServiceQuotas",
+            "servicequotas:GetServiceQuota",
+            # Applied quotas only exist once a customer has requested an
+            # increase. Without the default-quota read, an instance still
+            # sitting on AWS defaults reports no quota at all, and the
+            # headroom checks would degrade to SKIPPED on exactly the
+            # deployments most likely to be near a ceiling.
+            "servicequotas:ListAWSDefaultServiceQuotas",
+            "servicequotas:GetAWSDefaultServiceQuota",
+        ],
+        # "*": Service Quotas read APIs are scoped by service code, not by a
+        # resource ARN, so "*" is the only value IAM accepts. Read-only.
         "*",
     ),
 ]

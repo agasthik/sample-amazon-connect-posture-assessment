@@ -4,7 +4,7 @@ resilience, and CX maturity gaps.
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..models import (
     CheckStatus,
@@ -127,8 +127,18 @@ def _matches_indicators(node: JourneyNode, indicators: Dict[str, List[str]]) -> 
     return any(h in blob for h in hints)
 
 
-def generate_journey_findings(result: JourneyMapResult) -> List[Finding]:
-    """Produce Finding objects from scored journey results."""
+def generate_journey_findings(
+    result: JourneyMapResult, instance_id: Optional[str] = None
+) -> List[Finding]:
+    """Produce Finding objects from scored journey results.
+
+    ``instance_id`` identifies the instance the journeys were enumerated from.
+    It is optional only so existing callers keep working; pass it whenever it
+    is known, because ``journey-scope-001`` is instance-scoped and its
+    ``resource_id`` otherwise falls back to the literal string ``"instance"``,
+    which tells a reader nothing and cannot be correlated with the other
+    findings in a multi-instance account.
+    """
     findings: List[Finding] = []
 
     # Group journeys by entry number for per-DID analysis.
@@ -273,7 +283,7 @@ def generate_journey_findings(result: JourneyMapResult) -> List[Finding]:
                 pillar=Pillar.COST_OPTIMIZATION,
                 severity=Severity.LOW,
                 status=CheckStatus.FAIL,
-                resource_id="instance",
+                resource_id=instance_id or "instance",
                 resource_type="ConnectInstance",
                 description=(
                     f"{len(result.dormant_flows)} flows have zero traffic and no phone "

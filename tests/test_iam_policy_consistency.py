@@ -177,6 +177,7 @@ def test_ai_ops_policy_uses_wisdom_iam_prefix_for_qconnect_calls():
         "connect:ListIntegrationAssociations",
         "wisdom:GetAssistant",
         "wisdom:GetKnowledgeBase",
+        "wisdom:ListAIAgents",
         "wisdom:ListAIGuardrails",
         "wisdom:ListAIPrompts",
         "bedrock:GetModelInvocationLoggingConfiguration",

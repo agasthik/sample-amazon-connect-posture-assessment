@@ -6,7 +6,14 @@ Blast-radius security checks for Lambda functions reachable from contact flows.
 The check combines flow-content analysis (parser) with AWS API inspection
 (Lambda configs, IAM roles), and degrades to SKIPPED on access denied.
 
-Two checks were removed from this module rather than left in place:
+Three checks were removed from this module rather than left in place:
+
+``sec-ai-lambda-001`` took the same input as ``sec-excessive-agency-001`` (Lambda
+ARNs harvested from flow content), concerned the same subject (execution-role
+privilege), and recommended the same fix (scope the role down) — but it
+name-matched the ARN and asked the reader to go review the role, where
+``ExcessiveAgencyCheck`` below resolves the role and reads its inline policies. A
+weaker duplicate of a check that already measures the thing.
 
 ``sec-ai-lex-001`` failed every Lex integration it found, unconditionally. It
 could not read a bot's configuration, so a deployment with correctly guarded
@@ -23,9 +30,10 @@ missing any AI Lambda whose name does not advertise itself. Reimplementing it
 means deriving AI involvement from the execution role's granted actions, the way
 ``ExcessiveAgencyCheck`` below already resolves roles.
 
-Both are absent rather than approximated: a check that cannot distinguish a
-healthy configuration from a broken one does not belong in a report someone
-makes decisions from.
+All three are absent rather than approximated: a check that only duplicates one
+already measuring the condition, or that cannot distinguish a healthy
+configuration from a broken one, does not belong in a report someone makes
+decisions from.
 """
 
 from typing import Optional

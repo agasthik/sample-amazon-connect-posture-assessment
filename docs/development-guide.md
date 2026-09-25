@@ -99,14 +99,20 @@ python scripts/validate_environment.py
 python scripts/generate_readme_html.py
 ```
 
-Regenerate `docs/images/sample-assessment-report.png` after changing the sample
-report in `examples/`:
+Regenerate the README screenshots after changing the sample report in `examples/`:
 
 ```bash
 pip install -e ".[screenshots]"
 playwright install chromium
 python scripts/capture_screenshots.py
 ```
+
+One render writes both images: the full-length
+`docs/images/sample-assessment-report-full.png` (shown in a collapsed README section)
+and `docs/images/sample-assessment-report.png`, a crop from the Executive summary
+through the Caller journey map (`--preview-from` / `--preview-to`) shown inline.
+Pass `--no-preview` to skip the crop, or `--viewport-only` (with optional `--height`
+and `--scroll-y`) to capture a single viewport to `--output`.
 
 ---
 

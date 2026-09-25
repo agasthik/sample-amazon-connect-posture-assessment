@@ -64,6 +64,13 @@ Check out the sample [HTML report](https://aws-samples.github.io/sample-amazon-c
 
 ![Sample Amazon Connect Customer assessment report](docs/images/sample-assessment-report.png)
 
+<details>
+<summary>Show the full report screenshot</summary>
+
+![Full sample Amazon Connect Customer assessment report](docs/images/sample-assessment-report-full.png)
+
+</details>
+
 ---
 
 ## Quick start

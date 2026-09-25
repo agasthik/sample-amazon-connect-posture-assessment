@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, describe, it } from 'node:test';
 
 import { contractViolations, REQUIRED_FIELDS } from '../src/contract.js';
-import { defaultFilterQuery, loadReportData } from '../src/data.js';
+import { defaultFilterQuery, loadReportData, printableFindings } from '../src/data.js';
 import { downloadSvgAsPng, findingsCsv, pngOutputSize, safeFilenamePart } from '../src/download.js';
 
 const FIXTURE_TEXT = readFileSync(new URL('./fixtures/report-data.json', import.meta.url), 'utf8');
@@ -207,5 +207,27 @@ describe('defaultFilterQuery', () => {
     assert.deepEqual(defaultFilterQuery({ filters: { default_status: 'fail', default_severity: 'all' } }).tokens, [
       { propertyKey: 'status', operator: '=', value: 'fail' },
     ]);
+  });
+});
+
+describe('printableFindings', () => {
+  it('keeps every finding, failures and errors first, then by severity', () => {
+    const f = (key, status, severity, check_name = key) => ({ key, status, severity, check_name });
+    const findings = [
+      f('a', 'pass', 'critical'),
+      f('b', 'fail', 'low'),
+      f('c', 'error', 'critical'),
+      f('d', 'fail', 'critical', 'z'),
+      f('e', 'fail', 'critical', 'y'),
+      f('g', 'not_applicable', 'high'),
+    ];
+    const printed = printableFindings(findings);
+    assert.deepEqual(printed.map((x) => x.key), ['e', 'd', 'b', 'c', 'a', 'g']);
+    assert.equal(findings[0].key, 'a', 'input is not mutated');
+  });
+
+  it('includes all fixture findings regardless of the default table filter', () => {
+    const data = JSON.parse(FIXTURE_TEXT);
+    assert.equal(printableFindings(data.findings).length, data.findings.length);
   });
 });

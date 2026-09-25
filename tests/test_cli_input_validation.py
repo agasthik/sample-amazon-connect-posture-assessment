@@ -130,6 +130,51 @@ class TestValidateRunInputs:
 
         assert "not a directory" in error
 
+    def test_output_dir_under_a_file_is_rejected(self, tmp_path):
+        a_file = tmp_path / "file"
+        a_file.write_text("")
+
+        (error,) = validate_run_inputs(_merged("--output-dir", str(a_file / "reports")))
+
+        assert "cannot be created" in error and str(a_file) in error
+
+    def test_output_dir_parent_must_be_writable(self, tmp_path):
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        with patch.object(cli.os, "access", return_value=False):
+            (error,) = validate_run_inputs(_merged("--output-dir", str(locked / "a" / "b")))
+
+        assert "not writable" in error and str(locked) in error
+
+    def test_new_output_dir_under_writable_parent_passes(self, tmp_path):
+        assert validate_run_inputs(_merged("--output-dir", str(tmp_path / "a" / "b"))) == []
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--pillars", "resilience", "--checks", "security-iam-001"],
+            ["--checks", "security-iam-001", "--exclude-checks", "security-iam-001"],
+        ],
+    )
+    def test_filters_that_leave_no_checks_are_rejected(self, argv):
+        (error,) = validate_run_inputs(_merged(*argv))
+
+        assert "No checks remain" in error
+
+    def test_checks_disabled_in_config_count_toward_empty_selection(self):
+        config = _merged("--checks", "security-iam-001")
+        config["checks"] = {"security-iam-001": {"enabled": False}}
+
+        (error,) = validate_run_inputs(config)
+
+        assert "No checks remain" in error
+
+    def test_compatible_filters_pass(self):
+        assert (
+            validate_run_inputs(_merged("--pillars", "security", "--checks", "security-iam-001"))
+            == []
+        )
+
 
 class TestMainFailsFast:
     def _run_main(self, monkeypatch, *argv):

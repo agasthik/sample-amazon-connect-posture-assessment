@@ -18,6 +18,7 @@ import FindingDetail from './FindingDetail';
 import FindingsTable from './Findings';
 import JourneyDetail from './JourneyDetail';
 import JourneyMap from './JourneyMap';
+import PrintFindings from './PrintFindings';
 import { AssessmentDetails, ExecutiveSummary, Insights, Recommendations } from './Overview';
 import { downloadText, findingsCsv } from './download';
 
@@ -179,12 +180,15 @@ export default function App({ data }) {
                 // Journey details belong to the previous entry; an open finding stays open.
                 onClearSelection={() => setSelection((s) => (s?.kind === 'finding' ? s : undefined))}
               />
-              <FindingsTable
-                data={data}
-                selected={selection?.kind === 'finding' ? selection.finding : undefined}
-                onSelect={(f) => f && select({ kind: 'finding', finding: { ...f, pillarLabel: pillarLabel[f.pillar] ?? f.pillar } })}
-                filterRequest={filterRequest}
-              />
+              <div className="acr-no-print">
+                <FindingsTable
+                  data={data}
+                  selected={selection?.kind === 'finding' ? selection.finding : undefined}
+                  onSelect={(f) => f && select({ kind: 'finding', finding: { ...f, pillarLabel: pillarLabel[f.pillar] ?? f.pillar } })}
+                  filterRequest={filterRequest}
+                />
+              </div>
+              <PrintFindings data={data} pillarLabel={pillarLabel} />
               <AssessmentDetails data={data} />
               {data.raw_data && (
                 <ExpandableSection headerText="Raw assessment data" variant="container" headerDescription="The complete assessment result as JSON.">

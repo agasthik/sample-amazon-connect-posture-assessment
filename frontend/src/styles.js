@@ -1,11 +1,12 @@
 // Styling for server-rendered finding markdown (the one place the report shows
-// markup it didn't build from Cloudscape components). Values are Cloudscape
-// design tokens, so they follow light/dark mode.
+// markup it didn't build from Cloudscape components) and the print-only findings
+// table. Values are Cloudscape design tokens, so they follow light/dark mode.
 import {
   borderRadiusItem,
   colorBackgroundCodeView,
   colorBorderDividerDefault,
   colorTextLinkDefault,
+  fontFamilyBase,
   fontFamilyMonospace,
   spaceScaledS,
   spaceScaledXs,
@@ -27,6 +28,11 @@ const MARKDOWN_CSS = `
   border-radius: ${borderRadiusItem}; padding: ${spaceScaledS}; overflow: auto; margin: 0 0 ${spaceScaledS};
 }
 .acr-markdown pre code { background: none; padding: 0; }
+table.acr-print-findings { width: 100%; border-collapse: collapse; font-family: ${fontFamilyBase}; font-size: 11px; }
+.acr-print-findings th, .acr-print-findings td {
+  border: 1px solid ${colorBorderDividerDefault}; padding: ${spaceScaledXs}; text-align: start; vertical-align: top;
+}
+.acr-print-findings tr { break-inside: avoid; }
 @media print { .acr-no-print { display: none !important; } }
 `;
 

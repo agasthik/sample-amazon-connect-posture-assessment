@@ -290,7 +290,11 @@ problem. `--validate-config` runs the same checks and exits. The following are v
 - Numeric settings: `timeout`, `max_retry_attempts`, `max_workers`, and `batch_size` must be
   positive integers; retry delays must be non-negative, with `retry_max_delay >= retry_base_delay`.
 - Pillars, severities, and output formats must be known values.
-- `--checks` / `--exclude-checks` IDs must exist (see `--list-checks`).
+- `--checks` / `--exclude-checks` IDs must exist (see `--list-checks`), and at least one check
+  must remain after `--pillars`, `--severity`, `--checks`, `--exclude-checks`,
+  `--skip-flow-analysis`, and `enabled: false` entries in the config file are applied.
+- The output directory must be a directory, or creatable: its nearest existing parent must
+  be a writable directory.
 - The filename template may only use `{timestamp}`, `{account_id}`, `{region}`, and
   `{assessment_id}`, and must produce a filename, not a path.
 - `--s3-bucket` must be a valid S3 bucket name; `--diff` must be an existing JSON report;

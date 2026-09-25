@@ -37,7 +37,8 @@ the number of findings; use JSON or CSV when report size matters.
 Assessment data travels in a `<script id="report-data" type="application/json">`
 element (schema version 1), so it can also be extracted programmatically. The
 report's **Export** menu downloads that data as JSON, all findings as CSV, or
-prints to PDF.
+prints to PDF. Printing (from the menu or the browser) replaces the filtered,
+paginated findings table with a table of every finding.
 
 ## JSON
 

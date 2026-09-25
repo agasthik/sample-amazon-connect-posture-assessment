@@ -841,12 +841,51 @@ def merge_cli_args_with_config(args: argparse.Namespace, config: Dict[str, Any])
     return merged_config
 
 
+def check_registration_filters(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Keyword arguments for register_all_checks() derived from the merged config."""
+    cli_opts = config.get("cli", {})
+    enabled_pillars = config.get("enabled_pillars")
+
+    # NOTE: enabled_severities always has a default value (all four
+    # levels) from ConfigurationManager._get_default_config, so we
+    # only treat it as an active filter when the CLI/config narrowed
+    # it away from that default. Otherwise every run would silently
+    # filter to the default list even without --severity, which
+    # would be harmless today but fragile if the default set ever
+    # changes independent of this check.
+    severity_filter = None
+    enabled_severities = config.get("enabled_severities")
+    if enabled_severities and set(enabled_severities) != {"critical", "high", "medium", "low"}:
+        severity_filter = set(enabled_severities)
+
+    return {
+        "pillars": set(enabled_pillars) if enabled_pillars else None,
+        "severities": severity_filter,
+        "check_ids": set(cli_opts["checks"]) if cli_opts.get("checks") else None,
+        "exclude_check_ids": (
+            set(cli_opts["exclude_checks"]) if cli_opts.get("exclude_checks") else None
+        ),
+        "skip_flow_analysis": cli_opts.get("skip_flow_analysis", False),
+    }
+
+
+def _nearest_existing_path(path: str) -> str:
+    path = os.path.abspath(path)
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return path
+
+
 def validate_run_inputs(config: Dict[str, Any], log_file: Optional[str] = None) -> List[str]:
     """
     Check inputs that would otherwise fail only after the assessment has run.
 
-    Covers the log file, output directory, filename template, S3 bucket name,
-    --diff baseline, and --checks/--exclude-checks IDs. AWS-dependent checks
+    Covers the log file, output directory (or its nearest existing parent),
+    filename template, S3 bucket name, --diff baseline, --checks/--exclude-checks
+    IDs, and whether any check survives the registration filters. AWS-dependent checks
     (instance ID, permissions) are in AssessmentEngine.validate_configuration.
     """
     from .checks.registration import register_all_checks
@@ -866,9 +905,15 @@ def validate_run_inputs(config: Dict[str, Any], log_file: Optional[str] = None) 
         elif not os.access(log_dir, os.W_OK):
             errors.append(f"--log-file directory is not writable: {log_dir}")
 
-    output_dir = output.get("directory")
-    if output_dir and os.path.exists(output_dir) and not os.path.isdir(output_dir):
-        errors.append(f"Output directory {output_dir} exists and is not a directory")
+    output_dir = output.get("directory") or REPORTS_DIRECTORY
+    existing = _nearest_existing_path(output_dir)
+    if not os.path.isdir(existing):
+        if existing == os.path.abspath(output_dir):
+            errors.append(f"Output directory {output_dir} exists and is not a directory")
+        else:
+            errors.append(f"Output directory {output_dir} cannot be created: {existing} is a file")
+    elif not os.access(existing, os.W_OK | os.X_OK):
+        errors.append(f"Output directory {output_dir} is not writable ({existing})")
 
     template = output.get("filename_template")
     if template:
@@ -914,17 +959,40 @@ def validate_run_inputs(config: Dict[str, Any], log_file: Optional[str] = None) 
         "--checks": cli_opts.get("checks") or [],
         "--exclude-checks": cli_opts.get("exclude_checks") or [],
     }
-    if any(requested.values()):
+    # Registration logs its progress, which the real run repeats; problems
+    # found here are reported as validation errors instead.
+    previous_disable = logging.root.manager.disable
+    logging.disable(logging.WARNING)
+    try:
         catalog = CheckRegistry()
         register_all_checks(catalog)
-        known = set(catalog.list_check_ids())
-        for flag, ids in requested.items():
-            unknown = sorted(set(ids) - known)
-            if unknown:
-                errors.append(
-                    f"{flag}: unknown check ID(s) {', '.join(unknown)}; "
-                    "run --list-checks to see valid IDs"
-                )
+        effective = CheckRegistry()
+        register_all_checks(effective, **check_registration_filters(config))
+    finally:
+        logging.disable(previous_disable)
+
+    known = set(catalog.list_check_ids())
+    unknown_ids = False
+    for flag, ids in requested.items():
+        unknown = sorted(set(ids) - known)
+        if unknown:
+            unknown_ids = True
+            errors.append(
+                f"{flag}: unknown check ID(s) {', '.join(unknown)}; "
+                "run --list-checks to see valid IDs"
+            )
+
+    # Mirrors the `enabled: false` handling in CheckRegistry.load_checks_from_config.
+    disabled = {
+        check_id
+        for check_id, check_config in (config.get("checks") or {}).items()
+        if isinstance(check_config, dict) and not check_config.get("enabled", True)
+    }
+    if not unknown_ids and not set(effective.list_check_ids()) - disabled:
+        errors.append(
+            "No checks remain after applying --pillars, --severity, --checks, "
+            "--exclude-checks, --skip-flow-analysis, and checks disabled in the config file"
+        )
 
     return errors
 
@@ -965,45 +1033,14 @@ def initialize_assessment_components(config: Dict[str, Any]) -> tuple:
 
     # Initialize check registry and load checks
     check_registry = CheckRegistry()
+    filters = check_registration_filters(config)
+    skip_flow = filters["skip_flow_analysis"]
 
     # Register all checks using the central registration module.
     try:
         from .checks.registration import register_all_checks
 
-        cli_opts = config.get("cli", {})
-        pillar_filter = None
-        enabled_pillars = config.get("enabled_pillars")
-        if enabled_pillars:
-            pillar_filter = set(enabled_pillars)
-
-        # NOTE: enabled_severities always has a default value (all four
-        # levels) from ConfigurationManager._get_default_config, so we
-        # only treat it as an active filter when the CLI/config narrowed
-        # it away from that default. Otherwise every run would silently
-        # filter to the default list even without --severity, which
-        # would be harmless today but fragile if the default set ever
-        # changes independent of this check.
-        severity_filter = None
-        enabled_severities = config.get("enabled_severities")
-        all_severities = {"critical", "high", "medium", "low"}
-        if enabled_severities and set(enabled_severities) != all_severities:
-            severity_filter = set(enabled_severities)
-
-        check_ids_filter = set(cli_opts["checks"]) if cli_opts.get("checks") else None
-        exclude_check_ids = (
-            set(cli_opts["exclude_checks"]) if cli_opts.get("exclude_checks") else None
-        )
-
-        skip_flow = cli_opts.get("skip_flow_analysis", False)
-
-        register_all_checks(
-            check_registry,
-            pillars=pillar_filter,
-            severities=severity_filter,
-            check_ids=check_ids_filter,
-            exclude_check_ids=exclude_check_ids,
-            skip_flow_analysis=skip_flow,
-        )
+        register_all_checks(check_registry, **filters)
         logger.info(f"Registered {len(check_registry)} checks")
     except Exception as e:
         logger.warning(f"Failed to load checks: {str(e)}")

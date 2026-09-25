@@ -148,3 +148,18 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
 ]
+
+
+keywords = [
+  "amazon-connect",
+  "aws",
+  "security-assessment",
+  "well-architected",
+  "contact-center",
+]
+
+[project.urls]
+Homepage = "https://aws-samples.github.io/sample-amazon-connect-posture-assessment/"
+Documentation = "https://aws-samples.github.io/sample-amazon-connect-posture-assessment/docs/"
+Repository = "https://github.com/aws-samples/sample-amazon-connect-posture-assessment"
+Issues = "https://github.com/aws-samples/sample-amazon-connect-posture-assessment/issues"

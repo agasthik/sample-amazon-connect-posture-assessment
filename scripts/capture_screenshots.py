@@ -100,17 +100,14 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _prepare_page(page: Any, args: argparse.Namespace) -> None:
     """Load the report and apply deterministic state before capturing it."""
+    # The report UI reads its theme from localStorage["darkMode"] before the
+    # OS preference, so pinning it here makes captures independent of the host.
+    page.add_init_script(
+        f"window.localStorage.setItem('darkMode', '{str(args.dark_mode).lower()}');"
+    )
     page.goto(args.report.resolve().as_uri(), wait_until="domcontentloaded")
-    page.wait_for_selector(".report-header", timeout=10_000)
+    page.wait_for_selector("#root h1", timeout=10_000)
     page.wait_for_timeout(args.wait_ms)
-
-    if args.dark_mode:
-        toggle = page.locator(".dark-mode-toggle")
-        if toggle.count() == 0:
-            raise RuntimeError("The report does not expose a dark-mode toggle.")
-        if not page.locator("body.dark-mode").count():
-            toggle.click()
-            page.wait_for_timeout(250)
 
     page.evaluate("(scrollY) => window.scrollTo(0, scrollY)", args.scroll_y)
     page.wait_for_timeout(100)

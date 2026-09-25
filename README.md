@@ -1,4 +1,6 @@
-# Amazon Connect Customer Assessment Tool
+# Amazon Connect Well-Architected Posture Assessment Tool
+
+> Assess Amazon Connect across security, resilience, cost optimization, operational excellence, and performance efficiency using checks informed by AWS Well-Architected best practices.
 
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT--0-green.svg)](LICENSE)
@@ -14,7 +16,7 @@ No agents, no infrastructure to deploy, and nothing is modified in the account
 you assess.
 
 ```bash
-pipx install git+https://github.com/aws-samples/sample-connect-posture-assessment
+pipx install git+https://github.com/aws-samples/sample-amazon-connect-posture-assessment
 amazon-connect-assessment --region us-east-1 --output-dir ./reports
 ```
 
@@ -58,7 +60,7 @@ amazon-connect-assessment --region us-east-1 --output-dir ./reports
 
 ## Sample report
 
-Checkout the sample [`html report`](https://aws-samples.github.io/sample-connect-posture-assessment/examples/sample_assessment_report.html)
+Checkout the sample [`html report`](https://aws-samples.github.io/sample-amazon-connect-posture-assessment/examples/sample_assessment_report.html)
 
 ![Sample Amazon Connect Customer assessment report](docs/images/sample-assessment-report.png)
 
@@ -86,15 +88,15 @@ python3 -m pip install --user pipx      # Linux / Windows
 python3 -m pipx ensurepath
 
 # Install the assessment tool
-pipx install git+https://github.com/aws-samples/sample-connect-posture-assessment
+pipx install git+https://github.com/aws-samples/sample-amazon-connect-posture-assessment
 ```
 
 <details>
 <summary>Alternative: clone and install from source</summary>
 
 ```bash
-git clone https://github.com/aws-samples/sample-connect-posture-assessment
-cd sample-connect-posture-assessment
+git clone https://github.com/aws-samples/sample-amazon-connect-posture-assessment
+cd sample-amazon-connect-posture-assessment
 pipx install .
 ```
 

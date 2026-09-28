@@ -62,11 +62,11 @@ def test_documentation_runtime_count_matches_readme_and_catalog():
     catalog = CATALOG_PATH.read_text(encoding="utf-8")
 
     # Assert
-    assert f"**{check_count} assessment checks**" in readme
+    assert f"**{check_count} built-in assessment checks**" in readme
     assert f"{check_count} registered checks across 5 AWS Well-Architected pillars" in catalog
     for pillar, heading in PILLAR_HEADINGS.items():
         count = pillar_counts[pillar]
-        assert f"| {heading} | {count} |" in readme
+        assert re.search(rf"^\| {heading} \| {count}( built-in[^|]*)? \|", readme, re.MULTILINE)
         assert f"## {heading} — {count} checks" in catalog
 
 

@@ -12,6 +12,13 @@ license = {text = "MIT-0"}
 authors = [
     {name = "Amazon Connect Assessment Team"},
 ]
+keywords = [
+    "amazon-connect",
+    "aws",
+    "security-assessment",
+    "well-architected",
+    "contact-center",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: System Administrators",
@@ -146,15 +153,6 @@ exclude_lines = [
     "def __repr__",
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
-]
-
-
-keywords = [
-  "amazon-connect",
-  "aws",
-  "security-assessment",
-  "well-architected",
-  "contact-center",
 ]
 
 [project.urls]

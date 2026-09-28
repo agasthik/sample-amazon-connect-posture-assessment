@@ -84,8 +84,9 @@ For installation failures, see [troubleshooting.md](troubleshooting.md).
 
 ## AWS Access
 
-The assessment is read-only against the Amazon Connect Customer resources it inspects. The
-optional `--s3-output` feature writes only to its report bucket.
+The assessment is read-only against the Amazon Connect Customer resources it
+inspects. The optional `--s3-output` feature creates or hardens the selected
+report bucket and uploads generated reports.
 
 Confirm the active identity and region access:
 
@@ -226,6 +227,11 @@ remediation in the side panel. The Caller Journey Map renders contact flows
 targeted by inbound phone numbers; select any step or route to inspect it. See
 [report-formats.md](report-formats.md) for the output contracts.
 
+Journey finding evidence masks phone numbers to the last four digits. The
+Caller Journey Map uses full inbound phone numbers as entry-point labels, so
+HTML and JSON report payloads contain those numbers and should be handled as
+sensitive data.
+
 ### Publish reports to S3
 
 ```bash
@@ -237,8 +243,12 @@ amazon-connect-assessment \
 
 The default bucket is
 `amazon-connect-assessment-report-<account_id>`. Override it with
-`--s3-bucket`. The bucket is created with Block Public Access, SSE-S3
-encryption, and versioning enabled.
+`--s3-bucket`. A missing bucket is created with Block Public Access, SSE-S3
+encryption, and versioning enabled. If the target bucket already exists, the
+tool applies Block Public Access, enables versioning, and adds SSE-S3 default
+encryption only when the bucket does not already have an encryption
+configuration. Use a dedicated report bucket if those changes are not
+appropriate for an existing shared bucket.
 
 Required additional permissions include:
 

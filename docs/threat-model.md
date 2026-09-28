@@ -25,13 +25,15 @@ This document identifies the security boundaries, trust zones, threat actors, at
 The Amazon Connect Customer Assessment Tool is a **read-only** assessment tool that:
 - Runs as a CLI process on a user's workstation, AWS CloudShell, or a CI runner
 - Authenticates to AWS using existing credentials (profile, role assumption, or environment variables)
-- Makes read-only AWS API calls to Amazon Connect Customer and supporting services
+- Makes read-only assessment calls to Amazon Connect Customer and supporting services
 - Produces HTML/JSON/CSV/ASFF reports on the local filesystem
-- Optionally (`--s3-output`) uploads those reports to a dedicated, hardened S3 bucket in the assessed account
-- Never modifies, creates, or deletes any AWS resource it inspects
+- Optionally (`--s3-output`) creates or hardens a selected S3 report bucket in the assessed account and uploads reports
+- Never modifies, creates, or deletes assessed resources other than the selected S3 report bucket
 
-The only write operation the tool can perform is creating and writing to its own
-`amazon-connect-assessment-report-*` bucket, and only when `--s3-output` is passed.
+The only write path is `--s3-output`. It can create the default
+`amazon-connect-assessment-report-*` bucket or use an operator-selected existing
+bucket. Existing buckets receive Block Public Access and versioning; SSE-S3
+default encryption is added only when no encryption configuration exists.
 
 ---
 
@@ -83,6 +85,7 @@ The only write operation the tool can perform is creating and writing to its own
 | Threat | Category | Risk | Mitigation |
 |---|---|---|---|
 | XSS in HTML report via injected flow names or parameters | Elevation of Privilege | Medium | All assessment data is embedded as an escaped JSON data island and rendered as text by React (Cloudscape components). The only pre-rendered markup is finding markdown, produced by markdown-it with raw HTML disabled; markdown links must be absolute `http(s)`/`mailto` (others render as text) and images render as alt text, so the report never fetches remote content. Reference URLs are scheme-allowlisted (`_safe_url`). The inlined UI bundle is static, developer-built code; `</script`/`</style` sequences in it are neutralised on load. Jinja2 autoescaping stays on for the shell template. |
+| Full inbound phone numbers disclosed through a shared report | Information Disclosure | High | Journey finding evidence masks numbers, but the Caller Journey Map embeds full inbound numbers in HTML and JSON report payloads. Documentation instructs operators to treat reports as sensitive and restrict distribution and storage. |
 | Local report file accessible to unauthorized users | Information Disclosure | Medium | Reports written to a local directory; access governed by OS file permissions. |
 | Report tampering after generation | Tampering | Low | Reports are static, point-in-time snapshots. ASFF output can be verified via Security Hub import validation. |
 
@@ -91,6 +94,7 @@ The only write operation the tool can perform is creating and writing to its own
 | Threat | Category | Risk | Mitigation |
 |---|---|---|---|
 | Auto-created report bucket is world-readable | Information Disclosure | High | Buckets are created with S3 Block Public Access (all four flags), default SSE-S3 encryption, and versioning enabled. |
+| Existing shared bucket settings changed unexpectedly | Tampering | Medium | Publishing reapplies Block Public Access and enables versioning on any existing target bucket; it preserves an existing encryption configuration. Operators are told to use a dedicated bucket unless those changes are acceptable. |
 | Over-broad write permissions on the assessment role | Elevation of Privilege | Medium | The default CloudFormation role is read-only and does not grant S3 report-publishing writes. When `--s3-output` is enabled, operators must add a separate policy scoped to `arn:aws:s3:::amazon-connect-assessment-report-*` and its objects. Publishing is opt-in. |
 | Bucket-name takeover (global S3 namespace) | Spoofing | Low | `head_bucket` checks ownership before upload; a `403` (owned elsewhere) surfaces an error rather than silently uploading. Operators can override with `--s3-bucket`. |
 | Failed upload aborts the assessment | Denial of Service | Low | Upload failures are caught and reported; the assessment still succeeds and local reports remain. |
@@ -161,7 +165,7 @@ The only write operation the tool can perform is creating and writing to its own
 1. The execution host is not compromised — if it is, all bets are off (the attacker already has credential access).
 2. AWS API responses are authentic (TLS verified by boto3/botocore).
 3. Contact flow JSON may contain arbitrary string values but conforms to the Connect flow schema structure (dict with `Actions` array).
-4. When `--s3-output` is used, the operator intends to create/write the report bucket in the assessed account.
+4. When `--s3-output` is used, the operator intends to create or harden the selected report bucket and upload reports in the assessed account.
 
 ---
 

@@ -207,6 +207,7 @@ The assessment still succeeds and local reports are written even if the S3 uploa
 - **Missing permissions** — the identity needs `s3:CreateBucket`, `s3:PutObject`, `s3:ListBucket`, and the bucket-hardening puts (`s3:PutBucketPublicAccessBlock`, `s3:PutEncryptionConfiguration`, `s3:PutBucketVersioning`) on `arn:aws:s3:::amazon-connect-assessment-report-*`. These are separate from the read-only assessment policy and must be granted explicitly when `--s3-output` is enabled.
 - **Bucket name taken** — S3 bucket names are globally unique. If `amazon-connect-assessment-report-<account_id>` is already owned elsewhere, pass `--s3-bucket <your-unique-name>`.
 - **Wrong region** — the bucket is created in the run region (`--region`). A pre-existing bucket in another region will report a region mismatch; use `--s3-bucket` to point at the right one.
+- **Existing bucket settings** — publishing applies Block Public Access and enables versioning on an existing target bucket. It adds SSE-S3 default encryption only when no encryption configuration exists. Use a dedicated bucket if those changes are inappropriate for a shared bucket.
 
 ---
 

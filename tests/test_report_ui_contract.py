@@ -39,6 +39,7 @@ from amazon_connect_assessment.report_generator import ReportGenerator
 FIXTURE = (
     Path(__file__).resolve().parents[1] / "frontend" / "test" / "fixtures" / "report-data.json"
 )
+SAMPLE_REPORT = Path(__file__).resolve().parents[1] / "examples" / "sample_assessment_report.html"
 
 
 def _flow_entry(instance: ConnectInstance) -> dict:
@@ -207,3 +208,19 @@ def test_report_ui_fixture_exercises_optional_sections():
     assert committed["journey"]["entries"][0]["diagram_model"]["layout"]["connectors"]
     assert committed["execution_errors"]
     assert committed["filters"] == {"default_severity": "critical", "default_status": "fail"}
+
+
+def test_sample_report_embeds_current_ui_assets():
+    """The GitHub Pages sample must not drift from or corrupt the built UI bundle."""
+    html = SAMPLE_REPORT.read_text(encoding="utf-8")
+    generator = ReportGenerator()
+
+    style_start = html.index("<style>") + len("<style>")
+    style_end = html.index("</style>", style_start)
+    data_script = html.index('<script id="report-data" type="application/json">')
+    data_script_end = html.index("</script>", data_script)
+    script_start = html.index("<script>", data_script_end) + len("<script>")
+    script_end = html.index("</script>", script_start)
+
+    assert html[style_start:style_end] == generator._load_app_asset("report-app.css")
+    assert html[script_start:script_end] == generator._load_app_asset("report-app.js")

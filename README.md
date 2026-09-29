@@ -85,20 +85,66 @@ Check out the sample [HTML report](https://aws-samples.github.io/sample-amazon-c
 ### 2. Install
 
 The recommended install uses [pipx](https://pipx.pypa.io/), which keeps the tool
-in its own isolated environment and puts the command on your `PATH`:
+in its own isolated environment and puts the command on your `PATH`.
+
+First, check whether `pipx` is already installed. Run only the command inside
+the code block; do not copy the `bash` label or the triple backticks:
 
 ```bash
-# Install pipx once
-brew install pipx                       # macOS
-python3 -m pip install --user pipx      # Linux / Windows
-python3 -m pipx ensurepath
+pipx --version
+```
 
-# Install the assessment tool
+If the command prints a version, skip the installation step. If it reports
+`command not found`, install `pipx` for your operating system:
+
+**macOS:**
+
+```bash
+brew install pipx
+pipx ensurepath
+```
+
+**Linux:**
+
+```bash
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+```
+
+After installing, open a new terminal and confirm that `pipx` is available:
+
+```bash
+pipx --version
+```
+
+Then install the assessment tool:
+
+```bash
 pipx install git+https://github.com/aws-samples/sample-amazon-connect-posture-assessment
 ```
 
+If this command succeeds, installation is complete. You do not need to clone
+the repository.
+
+#### Verify the installation
+
+Run the version command to confirm that your shell can find the installed CLI
+and to display the release that pipx installed:
+
+```bash
+amazon-connect-assessment --version
+```
+
+If it prints a version, continue to the permissions step. Include this output
+when reporting an installation problem. The README intentionally does not name
+an expected version, so these instructions remain correct when a new release is
+published.
+
 <details>
-<summary>Alternative: clone and install from source</summary>
+<summary>Alternative for contributors: clone and install a local checkout</summary>
+
+Use this option only when you want to inspect or modify the source. Skip it if
+the primary `pipx install git+...` command succeeded.
 
 ```bash
 git clone https://github.com/aws-samples/sample-amazon-connect-posture-assessment
@@ -117,12 +163,6 @@ fastest way to run a one-off assessment. See
 and contributor virtual-environment setup.
 
 </details>
-
-Confirm the install:
-
-```bash
-amazon-connect-assessment --version
-```
 
 ### 3. Grant read permissions
 
@@ -220,7 +260,7 @@ conditions apply.
 
 | Pillar | Checks | Representative coverage |
 |---|---:|---|
-| Security | 19 | Storage and KMS encryption, CloudTrail audit coverage, IAM service-role least privilege, security-profile audit, CCP approved origins, toll fraud, prompt injection rated by exploitability, sensitive data in contact attributes, unvalidated Lambda output, Lex conversation-log encryption, Amazon Q guardrail attachment and encryption |
+| Security | 19 | Storage and KMS encryption, CloudTrail audit coverage, IAM service-role least privilege, security-profile audit, CCP approved origins, toll fraud, dynamic prompt safety review, sensitive data in contact attributes, unvalidated Lambda output, Lex conversation-log encryption, Amazon Q guardrail attachment and encryption |
 | Resilience | 16 | Amazon Connect Global Resiliency posture (identity type, traffic distribution group status and split, failover testing, phone-number binding), concurrent-call quota headroom and growth projection, configuration-object quota utilization, CloudWatch alarms, flow error handling, loop detection, carrier diversity, per-call-site Lambda dependency risk, Bedrock cross-region inventory |
 | Cost Optimization | 15 | Unused claimed numbers, self-service containment, callback opportunities, IVR data continuity into the agent screen pop, DTMF-only self-service tiers, idle configuration, hours-of-operation mismatch, premium-feature enablement, Amazon Q model cost review |
 | Operational Excellence | 6 built-in, 5 enabled | Contact flow logging, early media, SSML voice fallback, unreachable-block analysis, Amazon Q knowledge-base lifecycle and ingestion health, Bedrock invocation logging |

@@ -36,178 +36,384 @@ def _instance_with_flow(instance, flow_json, name="TestFlow", flow_type="CONTACT
 
 
 class TestDynamicPromptInjection:
-    def test_dynamic_ref_in_ssml_prompt_fails(self, make_check_context, sample_connect_instance):
-        # SSML is the tier that fails: the substituted value is parsed as markup,
-        # so a caller-supplied "<break time='9s'/>" is executed, not spoken.
-        flow = build_contact_flow(
-            [build_action("a1", "MessageParticipant", {"SSML": "Hello $.Attributes.Name"})]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.FAIL
-        assert finding.structured_remediation is not None
-
-    def test_static_prompt_passes(self, make_check_context, sample_connect_instance):
-        flow = build_contact_flow(
-            [build_action("a1", "MessageParticipant", {"Text": "Thank you for calling."})]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.PASS
-
-    # --- Severity tiers. The check previously reported every dynamic
-    # reference as HIGH "prompt injection". Only a prompt Polly interprets
-    # as SSML actually parses markup out of the substituted value; a
-    # plain-text prompt spoken back to the caller who supplied the value has
-    # no injection path at all. These pin that distinction down so the
-    # single-severity behaviour cannot creep back. ---
-
-    def test_ssml_prompt_is_high(self, make_check_context, sample_connect_instance):
-        flow = build_contact_flow(
-            [build_action("a1", "MessageParticipant", {"SSML": "Hello $.Attributes.Name"})]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.FAIL
-        assert finding.severity == Severity.HIGH
-        assert finding.evidence["flagged_prompts"][0]["interpreted_as"] == "ssml"
-
-    def test_texttype_discriminator_is_honoured(self, make_check_context, sample_connect_instance):
-        flow = build_contact_flow(
-            [
-                build_action(
-                    "a1",
-                    "MessageParticipant",
-                    {"Text": "Hello $.Attributes.Name", "TextType": "ssml"},
-                )
-            ]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.severity == Severity.HIGH
-
-    def test_plain_text_to_caller_is_informational_not_a_failure(
+    def test_prompt_check_attributes_ssml_returns_medium_review_candidate(
         self, make_check_context, sample_connect_instance
     ):
-        """
-        No markup parsing, and the caller hears back their own value.
+        # Arrange
+        flow = build_contact_flow(
+            [build_action("a1", "MessageParticipant", {"SSML": "Hello $.Attributes.Name"})]
+        )
+        instance = _instance_with_flow(sample_connect_instance, flow)
+        check = DynamicPromptInjectionCheck()
 
-        This is what ordinary personalization looks like, so failing it failed on
-        almost every instance while identifying nothing to fix. The prompt is
-        still reported — as evidence on a passing finding — so it stays traceable
-        if the attribute later comes from an external system or the prompt is
-        switched to SSML.
-        """
+        # Act
+        finding = check.execute(make_check_context(instance=instance))
+
+        # Assert
+        assert check.check_id == "sec-prompt-inject-001"
+        assert check.name == "Potential Unsafe Dynamic Content in Prompts"
+        assert check.severity == Severity.MEDIUM
+        assert finding.status == CheckStatus.FAIL
+        assert finding.severity == Severity.MEDIUM
+        candidate = finding.evidence["actionable_review_candidates"][0]
+        assert candidate == finding.evidence["flagged_prompts"][0]
+        assert candidate["action_type"] == "MessageParticipant"
+        assert candidate["dynamic_refs"] == ["$.Attributes.Name"]
+        assert candidate["source_categories"] == ["attributes_unknown"]
+        assert candidate["prompt_preview"] == "Hello $.Attributes.Name"
+        assert candidate["interpreted_as"] == "ssml"
+        assert candidate["flow_type"] == "CONTACT_FLOW"
+        assert candidate["reachable"] is True
+        assert candidate["audience_basis"] == (
+            "flow type does not establish an agent/other audience"
+        )
+        assert candidate["sanitization_assessed"] is False
+        assert "does not prove" in finding.description
+        assert "unknown unless its writer is traced" in finding.description
+
+    def test_prompt_check_external_ssml_classifies_external_result(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        flow = build_contact_flow(
+            [build_action("a1", "PlayPrompt", {"SSML": "Status $.External.Result"})]
+        )
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        candidate = finding.evidence["actionable_review_candidates"][0]
+        assert finding.severity == Severity.MEDIUM
+        assert candidate["dynamic_refs"] == ["$.External.Result"]
+        assert candidate["source_categories"] == ["external_or_lambda_result"]
+
+    def test_prompt_check_supported_reference_roots_records_source_categories(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        prompt = (
+            "$.Lex.Slots.Name $.Media.InitialMessage $.SegmentAttributes.Topic "
+            "$.Media.Sip.Headers.X-Test $.Customer.Name $.Attributes.Name "
+            "$.CustomSource.Value"
+        )
+        flow = build_contact_flow([build_action("a1", "PlayPrompt", {"SSML": prompt})])
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        candidate = finding.evidence["actionable_review_candidates"][0]
+        assert candidate["source_categories"] == [
+            "lex",
+            "media_initial_message",
+            "segment_attributes",
+            "sip_metadata",
+            "customer",
+            "attributes_unknown",
+            "unknown",
+        ]
+
+    def test_prompt_check_plain_text_generic_flow_returns_pass_with_information(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
         flow = build_contact_flow(
             [build_action("a1", "MessageParticipant", {"Text": "Hello $.Attributes.Name"})]
         )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.PASS
-        reported = finding.evidence["informational_prompts_spoken_to_source"]
-        assert len(reported) == 1
-        assert reported[0]["risk_tier"] == "spoken_to_source"
+        instance = _instance_with_flow(sample_connect_instance, flow)
 
-    def test_plain_text_in_agent_whisper_is_medium(
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.PASS
+        assert finding.evidence["actionable_review_candidates"] == []
+        assert len(finding.evidence["informational_dynamic_references"]) == 1
+        assert "No reachable prompt met the review threshold" in finding.description
+
+    def test_prompt_check_agent_whisper_plain_text_returns_medium_review_candidate(
         self, make_check_context, sample_connect_instance
     ):
-        """Audience is the agent, so caller-authored text can mislead them."""
+        # Arrange
         flow = build_contact_flow(
-            [build_action("a1", "MessageParticipant", {"Text": "Caller said $.Attributes.Reason"})]
+            [build_action("a1", "MessageParticipant", {"Text": "Reason $.Attributes.Reason"})]
         )
-        inst = _instance_with_flow(sample_connect_instance, flow, flow_type="AGENT_WHISPER")
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
+        instance = _instance_with_flow(sample_connect_instance, flow, flow_type="AGENT_WHISPER")
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.FAIL
         assert finding.severity == Severity.MEDIUM
-        assert finding.evidence["flagged_prompts"][0]["risk_tier"] == "other_audience"
+        assert finding.evidence["actionable_review_candidates"][0]["interpreted_as"] == "text"
 
-    def test_worst_tier_sets_finding_severity(self, make_check_context, sample_connect_instance):
-        """One SSML prompt must not be diluted by harmless plain-text ones."""
-        flow = build_contact_flow(
-            [
-                build_action("a1", "MessageParticipant", {"Text": "Hi $.Attributes.Name"}),
-                build_action("a2", "MessageParticipant", {"SSML": "Hi $.Attributes.Name"}),
-            ]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.severity == Severity.HIGH
-        assert len(finding.evidence["flagged_prompts"]) == 2
-
-    # --- Reviewer feedback: system attributes (queue name, agent name,
-    # etc) are Connect-populated/admin-configured and a caller cannot
-    # influence what they resolve to, so referencing one in a prompt is
-    # not the SSML-injection risk this check exists to catch. Previously
-    # every "$." reference was flagged the same way, including
-    # $.Queue.Name — the reviewer noted this without further context. ---
-
-    def test_system_attribute_only_reference_passes(
+    def test_prompt_check_system_root_prefix_collision_returns_review_candidate(
         self, make_check_context, sample_connect_instance
     ):
+        # Arrange
         flow = build_contact_flow(
-            [
-                build_action(
-                    "a1", "MessageParticipant", {"Text": "You are in the $.Queue.Name queue."}
-                )
-            ]
+            [build_action("a1", "PlayPrompt", {"SSML": "Hello $.AgentControlled.Name"})]
         )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.PASS
-        assert finding.evidence["system_attribute_prompts_excluded"] == 1
+        instance = _instance_with_flow(sample_connect_instance, flow)
 
-    def test_agent_name_system_attribute_passes(self, make_check_context, sample_connect_instance):
-        flow = build_contact_flow(
-            [
-                build_action(
-                    "a1",
-                    "MessageParticipant",
-                    {"Text": "You're speaking with $.Agent.FirstName."},
-                )
-            ]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
-        assert finding.status == CheckStatus.PASS
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
 
-    def test_caller_sourced_reference_still_fails(
-        self, make_check_context, sample_connect_instance
-    ):
-        # A user-defined attribute (set from caller input, a Lex slot, or
-        # a Lambda lookup) is NOT a system attribute and must still be
-        # flagged -- this is the actual injection risk. Shown in SSML, where
-        # the substituted value is parsed rather than spoken.
-        flow = build_contact_flow(
-            [
-                build_action(
-                    "a1",
-                    "MessageParticipant",
-                    {"SSML": "Hello, $.Attributes.CustomerName."},
-                )
-            ]
-        )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
+        # Assert
+        candidate = finding.evidence["actionable_review_candidates"][0]
         assert finding.status == CheckStatus.FAIL
+        assert candidate["source_categories"] == ["unknown"]
         assert finding.evidence["system_attribute_prompts_excluded"] == 0
 
-    def test_mixed_system_and_caller_reference_still_fails(
+    def test_prompt_check_stored_customer_input_ssml_returns_pass_as_constrained(
         self, make_check_context, sample_connect_instance
     ):
-        # A prompt mixing a safe system attribute with a caller-sourced
-        # one must still be flagged -- the caller-sourced part is the risk.
+        # Arrange
+        flow = build_contact_flow(
+            [build_action("a1", "PlayPrompt", {"SSML": "Digits $.StoredCustomerInput"})]
+        )
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.PASS
+        assert finding.evidence["actionable_review_candidates"] == []
+        assert finding.evidence["constrained_reference_prompts_excluded"] == 1
+
+    def test_prompt_check_customer_endpoint_address_ssml_returns_pass_as_constrained(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        flow = build_contact_flow(
+            [build_action("a1", "PlayPrompt", {"SSML": "Number $.CustomerEndpoint.Address"})]
+        )
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.PASS
+        excluded = finding.evidence["excluded_reference_prompts"][0]
+        assert excluded["source_categories"] == ["constrained_customer_endpoint_address"]
+
+    def test_prompt_check_unreachable_dynamic_prompt_returns_pass_without_evidence(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        flow = build_contact_flow(
+            [
+                build_action("entry", "DisconnectParticipant"),
+                build_action("orphan", "PlayPrompt", {"SSML": "Hello $.External.Name"}),
+            ],
+            start_action="entry",
+        )
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.PASS
+        assert finding.evidence["actionable_review_candidates"] == []
+        assert finding.evidence["informational_dynamic_references"] == []
+        assert finding.evidence["excluded_reference_prompts"] == []
+
+    def test_prompt_check_missing_entry_returns_skipped_with_disclosure(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        flow = build_contact_flow(
+            [build_action("a1", "PlayPrompt", {"SSML": "Hello $.External.Name"})],
+            start_action="missing",
+        )
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.SKIPPED
+        assert finding.evidence["flows_analyzed"] == 0
+        assert finding.evidence["analysis_complete"] is False
+        assert finding.evidence["unanalyzed_flows"][0]["reason"] == (
+            "entry action is missing or invalid"
+        )
+        assert "did not scan every action as a fallback" in finding.description
+
+    def test_prompt_check_unavailable_input_flow_returns_skipped(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        instance = _instance_with_flow(sample_connect_instance, None)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.SKIPPED
+        assert finding.evidence["flows_parsed"] == 0
+        assert finding.evidence["unanalyzed_flows"][0]["reason"] == "flow content unavailable"
+
+    def test_prompt_check_partial_entry_failure_discloses_incomplete_analysis(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        valid_flow = build_contact_flow(
+            [build_action("candidate", "PlayPrompt", {"SSML": "Hello $.External.Name"})]
+        )
+        invalid_flow = build_contact_flow(
+            [build_action("hidden", "PlayPrompt", {"SSML": "Hello $.External.Hidden"})],
+            start_action="missing",
+        )
+        instance = _instance_with_flow(sample_connect_instance, valid_flow, name="ValidFlow")
+        instance.contact_flows.append(
+            ContactFlow(
+                id="f2",
+                arn="arn:aws:connect:us-east-1:123:instance/i/flow/f2",
+                name="InvalidFlow",
+                type="CONTACT_FLOW",
+                state="ACTIVE",
+                content=invalid_flow,
+            )
+        )
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.FAIL
+        assert finding.evidence["flows_analyzed"] == 1
+        assert finding.evidence["flows_unanalyzed"] == 1
+        assert finding.evidence["analysis_complete"] is False
+        assert [row["action_id"] for row in finding.evidence["actionable_review_candidates"]] == [
+            "candidate"
+        ]
+        assert "Analysis was incomplete for 1 flow(s)" in finding.description
+
+    def test_prompt_check_partial_analysis_without_candidate_returns_skipped(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        valid_flow = build_contact_flow(
+            [build_action("entry", "MessageParticipant", {"Text": "Hello"})]
+        )
+        invalid_flow = build_contact_flow(
+            [build_action("hidden", "PlayPrompt", {"SSML": "Hello $.External.Hidden"})],
+            start_action="missing",
+        )
+        instance = _instance_with_flow(sample_connect_instance, valid_flow, name="ValidFlow")
+        instance.contact_flows.append(
+            ContactFlow(
+                id="f2",
+                arn="arn:aws:connect:us-east-1:123:instance/i/flow/f2",
+                name="InvalidFlow",
+                type="CONTACT_FLOW",
+                state="ACTIVE",
+                content=invalid_flow,
+            )
+        )
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert finding.status == CheckStatus.SKIPPED
+        assert finding.evidence["flows_analyzed"] == 1
+        assert finding.evidence["flows_unanalyzed"] == 1
+        assert "could not inspect every input contact flow" in finding.description
+
+    def test_prompt_check_mixed_rows_targets_only_actionable_action(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
         flow = build_contact_flow(
             [
                 build_action(
-                    "a1",
+                    "info",
                     "MessageParticipant",
-                    {"SSML": "Queue $.Queue.Name, customer $.Attributes.CustomerName."},
-                )
+                    {"Text": "Hello $.Attributes.Name"},
+                    next_action="candidate",
+                ),
+                build_action(
+                    "candidate", "MessageParticipant", {"SSML": "Status $.External.Result"}
+                ),
             ]
         )
-        inst = _instance_with_flow(sample_connect_instance, flow)
-        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=inst))
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        assert [row["action_id"] for row in finding.evidence["actionable_review_candidates"]] == [
+            "candidate"
+        ]
+        assert [
+            row["action_id"] for row in finding.evidence["informational_dynamic_references"]
+        ] == ["info"]
+        assert finding.structured_remediation.target_resources == ["candidate"]
+
+    def test_prompt_check_review_description_uses_conditional_customer_language(
+        self, make_check_context, sample_connect_instance
+    ):
+        # Arrange
+        flow = build_contact_flow(
+            [build_action("a1", "PlayPrompt", {"SSML": "Hello $.Attributes.Name"})]
+        )
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
+        lowered = finding.description.lower()
+        assert "comes from caller" not in lowered
+        assert "without sanitizing" not in lowered
+        assert "</speak><speak>" not in lowered
+        assert "allows arbitrary text" in lowered
+        assert "without the required escaping" in lowered
+        assert "another person" in lowered
+        assert "error branch" in lowered
+        assert "trusted ivr or agent instructions" in lowered
+        assert "code execution or account takeover" in lowered
+        assert '<break time="10s"/>' in finding.description
+        assert "runtime behavior still needs validation" in lowered
+        remediation = finding.remediation
+        assert "DTMF" in remediation
+        assert "fixed enum" in remediation
+        assert "trusted constant" in remediation
+        assert "XML-escape &, <, and >" in remediation
+        assert "Error branch" in remediation
+        assert "Check contact attributes" not in remediation
+
+    def test_prompt_check_execution_avoids_polly_and_network_calls(
+        self, make_check_context, sample_connect_instance, monkeypatch
+    ):
+        # Arrange
+        flow = build_contact_flow(
+            [build_action("a1", "PlayPrompt", {"SSML": "Hello $.External.Name"})]
+        )
+        instance = _instance_with_flow(sample_connect_instance, flow)
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("unit check attempted an external call")
+
+        monkeypatch.setattr("boto3.client", fail_if_called)
+        monkeypatch.setattr("socket.create_connection", fail_if_called)
+
+        # Act
+        finding = DynamicPromptInjectionCheck().execute(make_check_context(instance=instance))
+
+        # Assert
         assert finding.status == CheckStatus.FAIL
-        assert finding.evidence["system_attribute_prompts_excluded"] == 0
+        assert finding.severity == Severity.MEDIUM
 
 
 # --- Lambda response validation (sec-lambda-validation-001) ---
